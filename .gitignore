@@ -7,6 +7,7 @@ run_model_details.py
 test_forward_memory.py
 main_Train_details.py
 train_model_Train.py
+_balanced_truncate_event_DETAILS.py
 
 .DS_Store
 

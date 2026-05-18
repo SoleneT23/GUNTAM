@@ -71,6 +71,8 @@ class PreprocessingConfig:
         # Parallelism
         self.num_workers = 1  # Number of parallel worker processes for batch processing. 
 
+        self.random_state = 1993
+        
     def add_args(self, parser: argparse.ArgumentParser) -> None:
         """
         Add preprocessing arguments to an existing ArgumentParser.

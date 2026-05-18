@@ -288,6 +288,78 @@ def _to_tensor(
     return hits_tensor, hit_to_particle_tensor 
 
 
+def _balanced_truncate_event(
+    event_hits: pd.DataFrame,
+    max_hits: int,
+    random_state:int = 1993,
+)-> pd.DataFrame:
+    """
+    """
+    if len(event_hits) <= max_hits:
+        return event_hits.reset_index(drop=True)
+    
+    real_hits = event_hits[event_hits["particle_id"] >= 0]
+    particle_ids = sorted(real_hits["particle_id"].unique())
+    
+    if len(particle_ids) == 0:
+        return event_hits.sample(
+            n=max_hits,
+            random_state=random_state,
+        ).reset_index(drop=True)
+    
+    n_particles = len(particle_ids)
+    
+    if n_particles * 2 <= max_hits:
+        quota_per_particle = max(2, max_hits // n_particles)
+    
+    else:
+        quota_per_particle = max(1, max_hits // n_particles)
+        
+    selected_parts = []
+    
+    for pid in particle_ids:
+        hits_pid = real_hits[real_hits["particle_id" == pid]]
+        
+        n_take = min(len(hits_pid), quota_per_particle)
+        
+        if n_take > 0:
+            selected_pid = hits_pid.sample(
+                n=n_take,
+                random_state=random_state,
+            )
+            selected_parts.append(selected_pid)
+            
+    if len(selected_parts) > 0:
+        selected = pd.concat(selected_parts, axis=0)
+    else:
+        selected = pd.DataFrame(columns=event_hits.columns)
+        
+    if len(selected) > max_hits:
+        selected = selected.sample(
+            n=max_hits,
+            random_state=random_state,
+        )
+        
+    remaining_capacity = max_hits - len(selected)
+    
+    if remaining_capacity > 0:
+        remaining_hits = event_hits.drop(index=selected.index)
+        
+        if len(remaining_hits) > 0:
+            extra_hits = remaining_hits.sample(
+                n=min(remaining_capacity, len(remaining_hits)),
+                random_state=random_state,
+            )
+            selected = pd.concat([selected, extra_hits], axis=0)
+            
+    selected = selected.sample(
+        frac=1,
+        random_state=random_state,
+    ).reset_index(drop=True)
+    
+    return selected
+        
+
 def _add_padding(
     data_batch: pd.DataFrame,
     cfg: PreprocessingConfig,
@@ -328,7 +400,11 @@ def _add_padding(
         # Remove excess hits
         if num_hits > max_hits:
             num_real_hits_truncated += num_hits - max_hits
-            event_hits = event_hits.iloc[:max_hits].copy()
+            event_hits = _balanced_truncate_event(
+                event_hits=event_hits,
+                max_hits=max_hits,
+                random_state=getattr(cfg, "random_state", 1993) + int(event_id), # different events get different seeds
+            )
     
         # Add padding if there are fewer than max_hits
         elif num_hits < max_hits:
