@@ -15,7 +15,7 @@ from GUNTAM.Transformer.Utils import ts_print
 import GUNTAM.Transformer.Utils as Utils
 import GUNTAM.Seed.Reconstruction as Reconstruction
 from GUNTAM.Seed.Monitoring import PerformanceMonitor
-from GUNTAM.IO.PrepareTensor import compute_barcode, prepare_tensor
+from GUNTAM.IO.PrepareTensor import compute_barcode, prepare_tensor, sample_positive_pairs_from_particle_ids
 
 
 def initialize_loss_dictionary(active_components: list, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -32,11 +32,11 @@ def initialize_loss_dictionary(active_components: list, device: torch.device) ->
 
     # Helper to add a key lazily
     def add_loss_key(key: str):
-        if key not in event_losses:
-            event_losses[key] = torch.tensor(0.0, device=device)
+        if key not in event_loss_log:
+            event_loss_log[key] = torch.tensor(0.0, device=device)
 
     # Initialize per-event losses dynamically based on active loss components
-    event_losses = {"total": torch.tensor(0.0, device=device)}
+    event_loss_log = {"total": torch.tensor(0.0, device=device)}
 
     # Attention variants
     if "attention" in active_components:
@@ -54,15 +54,14 @@ def initialize_loss_dictionary(active_components: list, device: torch.device) ->
     if "hit_BCE" in active_components:
         add_loss_key("hit_BCE")
 
-    return event_losses
+    return event_loss_log
 
 
 def train_model(
     model: SeedTransformer,
     train_file_indices: list,
     dataset: DataLoader,
-    nb_events: int,
-    batch_size: int,
+    nb_events: int, 
     cfg: SeedConfig,
     writer: SummaryWriter,
     optimiser: torch.optim.Optimizer,
@@ -77,7 +76,6 @@ def train_model(
         train_file_indices: List of file indices for training data.
         dataset: The dataset object containing training data.
         nb_events: Number of events per file.
-        batch_size: Batch size for training.
         cfg: Configuration object with training parameters.
         writer: TensorBoard writer for logging.
         optimiser: Optimizer for training.
@@ -87,6 +85,7 @@ def train_model(
     Returns:
         The trained transformer model.
     """
+    
     epoch_nb = cfg.epoch_nb
 
     # Loop over the number of epoch starting from start_epoch
@@ -100,24 +99,23 @@ def train_model(
 
     ts_print("Active loss components: " + ", ".join(active_losses))
 
-    if optimiser and scheduler:
-        scheduler.step()
+    if optimiser is not None and scheduler is not None: 
         print(f"Initial learning rate: {scheduler.get_last_lr()}")
 
     for epoch in range(start_epoch, start_epoch + epoch_nb):
         ts_print("Epoch: ", epoch)
-        entry = 0
+        entry = 0 # counter increases for every processed event
 
         # Track epoch-level losses
         epoch_train_losses = []
         epoch_val_losses = []
 
-        # Deterministic split of files into training/validation sets (no shuffling)
+        # Deterministic split of files into training/validation sets (no shuffling), validation may be empty
         files = list(train_file_indices)
         n_val_files = int(cfg.val_fraction * len(files)) if hasattr(cfg, "val_fraction") else 0
         val_files_set = set(files[-n_val_files:]) if n_val_files > 0 else set()
 
-        for file_idx in files:
+        for file_idx in files: # the tensor_data_i_MH5000.pt files
             # Decide status per file to keep train/val files separate
             status = "Validation" if file_idx in val_files_set else "Training"
             if status == "Validation":
@@ -128,207 +126,181 @@ def train_model(
             model_dtype = model.dtype
             # Load the data
             batch_data = dataset.get_file(file_idx)
-            hits_tensor = batch_data["hits_tensor"].to(cfg.device_acc, dtype=model_dtype)
-            particles_tensor = batch_data["particles_tensor"].to(cfg.device_acc, dtype=model_dtype)
-            hit_to_particle_tensor = batch_data["hit_to_particle_tensor"].to(cfg.device_acc)
-            padding_mask = batch_data["padding_mask"].to(cfg.device_acc)
-            good_pairs = batch_data["good_pairs"].to(cfg.device_acc)
+            
+            # Checking files are on CPU
+            # print("hits_tensor device:", batch_data["hits_tensor"].device)
+            # print("hit_to_particle_tensor device:", batch_data["hit_to_particle_tensor"].device)
+            # print("padding_mask device:", batch_data["padding_mask"].device)
 
+            hits_tensor = batch_data["hits_tensor"] # we don't move the files to GPU, they stay on CPU, only the current event will be moved to GPU
+            hit_to_particle_tensor = batch_data["hit_to_particle_tensor"]
+            padding_mask = batch_data["padding_mask"]
+            
             # Iterate through each event in this batch with a random order
             num_events_in_batch = hits_tensor.shape[0]
             event_indices = list(range(num_events_in_batch))
-            random.shuffle(event_indices)
+            random.shuffle(event_indices) # training does not see events in the same order every epoch
 
             for event_idx in event_indices:
-                num_valid_bins = 0
-                # Extract data for this specific event
-                batch_hits_tensor = hits_tensor[event_idx]  # [num_bin, max_hit_input, num_hit_features]
-                batch_good_pairs = good_pairs[event_idx]  # [num_bin, num_pairs, 3]
-                batch_padding_mask = padding_mask[event_idx]  # [num_bin, max_hit_input, 1]
-
-                batch_hit_to_particle_tensor = hit_to_particle_tensor[event_idx]  # [num_bin, max_hit_input, 1]
-                batch_particles_tensor = particles_tensor[event_idx]  # [num_particles, num_particle_features]
-
-                event_losses = initialize_loss_dictionary(list(cfg.loss_config.keys()), cfg.device_acc)
-
-                # Process bins in batches of size batch_size
                 grad_enabled = status == "Training"
-                accumulated_loss = torch.tensor(0.0, device=cfg.device_acc, requires_grad=True)
-
-                # Collect all bins with valid pairs (vectorized)
-                valid_bins = torch.where(batch_good_pairs.sum(dim=(1, 2)) > 0)[0].tolist()
+                event_loss_log = initialize_loss_dictionary(list(cfg.loss_config.keys()), cfg.device_acc) # a container for numbers, not part of the computation graph
 
                 with torch.set_grad_enabled(grad_enabled):
+                    batched_hits = hits_tensor[event_idx].to(cfg.device_acc) # [num_bin=1, max_hit_input, num_hit_features]
+                    event_particle_ids = hit_to_particle_tensor[event_idx].to(cgf.device_acc)  # [num_bin, max_hit_input, 1]
+                    batched_mask = padding_mask[event_idx].to(cfg.device_acc) # [num_bin, max_hit_input]
+                    particle_ids_bin = event_particle_ids[0, :, 0] # [max_hit_input]
+                    
+                    pairs1, pairs2, target = sample_positive_pairs_from_particle_ids(particle_ids_bin, max_positive_pairs=20_000) # try 100_000
+                    
+                    if pairs1.numel() == 0:
+                        continue
+                    
+                    event_loss_terms = initialize_loss_dictionary(list(cfg.loss_config.keys()), cfg.device_acc)
+                    
+                    if status == "Training":
+                        optimiser.zero_grad()
+                    
+                    encoded_space_points, attention_maps = model(
+                        batched_hits,
+                        batched_mask,
+                    )
+                    
+                    attention_map_bin = attention_maps[0] # shape [max_hit_input, max_hit_input]
+                    
+                    if attention_map_bin.dim() == 3:
+                        attention_map_bin = attention_map_bin.squeeze(0)
+                    
+                    if cfg.has_loss_component("attention"):
+                        event_loss_terms["attention"] = Losses.attention_loss(
+                            attention_map_bin,
+                            pairs1,
+                            pairs2,
+                            target,
+                        )
+                        
+                    if cfg.has_loss_component("full_attention"):
+                        event_loss_terms["full_attention"] = Losses.full_attention_loss(
+                            attention_map_bin,
+                            pairs1,
+                            pairs2,
+                            target,
+                        )
+                        
+                    if cfg.has_loss_component("topk_attention"):
+                        event_loss_terms["topk_attention"] = Losses.top_attention_loss(
+                            attention_map_bin,
+                            pairs1,
+                            pairs2,
+                            target,
+                        )
+                        
+                    if cfg.has_loss_component("attention_next"):
+                        event_loss_terms["attention_next"] = Losses.attention_next_loss(
+                            attention_map_bin,
+                            pairs1,
+                            pairs2,
+                            target,
+                        )
 
-                    # Loop over the event batch
-                    for batch_start in range(0, len(valid_bins), batch_size):
+                    if cfg.has_loss_component("attention_back"):
+                        event_loss_terms["attention_back"] = Losses.attention_backward_loss(
+                            attention_map_bin,
+                            pairs1,
+                            pairs2,
+                            target,
+                        )
 
-                        batch_bin_indices = valid_bins[batch_start : batch_start + batch_size]
-                        batched_hits = batch_hits_tensor[batch_bin_indices]  # [batch_size, max_hit_input, num_hit_features]
-                        batched_masks = batch_padding_mask[batch_bin_indices]  # [batch_size, max_hit_input]
-                        batched_pairs = batch_good_pairs[batch_bin_indices]  # [batch_size, num_pairs, 3]
-                        batched_hit_to_particle_indices = batch_hit_to_particle_tensor[batch_bin_indices].squeeze(
-                            -1
-                        )  # [batch_size, max_hit_input]
-                        # Gather particles using the hit-to-particle mapping
-                        batched_particles = batch_particles_tensor[
-                            batched_hit_to_particle_indices
-                        ]  # [batch_size, max_hit_input, num_particle_features]
-                        # Skip if no valid bins in this batch
-                        if len(batch_bin_indices) == 0:
+                    total_loss = torch.tensor(
+                        0.0, # scalar tensor
+                        device=cfg.device_acc,
+                        dtype=model_dtype,
+                    )
+                
+                    for key, value in event_loss_terms.items():
+                        if key == "total":
                             continue
 
-                        batch_loss = initialize_loss_dictionary(list(cfg.loss_config.keys()), cfg.device_acc)
+                        event_loss_log[key] += value.detach()
 
-                        # Perform the hit embedding for all bins in one forward pass
-                        encoded_space_points, attention_maps = model(
-                            batched_hits, batched_masks
-                        )  # encoded_space_points: [N, max_hit_input, dim_embedding]
+                        weighted_value = cfg.get_loss_weight(key) * value
+                        event_loss_log["total"] += weighted_value.detach()
 
-                        # Compute reconstructed parameters if needed
-                        if cfg.transformer_config.regression and cfg.has_loss_component("hit_BCE"):
+                    if status == "Training":
+                        total_loss = total_loss + weighted_value
 
-                            hits_score = encoded_space_points  # [N, max_hit_input, 1]
-                            if cfg.has_loss_component("hit_BCE"):
-                                batch_loss["hit_BCE"] = Losses.hit_classification_loss(
-                                    hits_score,
-                                    batched_particles,
-                                    batched_masks,
-                                )
-
-                        # Process each bin's results for pair-based losses
-                        for idx_in_batch, bin_idx in enumerate(batch_bin_indices):
-                            pairs1, pairs2, target = batched_pairs[idx_in_batch].unbind(
-                                dim=1
-                            )  # [num_pairs], [num_pairs], [num_pairs]
-
-                            # Skip bins with no valid pairs (all zeros after orphan filtering)
-                            if target.sum() == 0:
-                                print(f"Skipping bin {bin_idx.item()} in event {entry} due to no valid pairs after filtering.")
-                                continue
-
-                            # Extract this bin's attention map and squeeze batch dim -> [seq_len, seq_len]
-                            attention_map_bin = attention_maps[idx_in_batch].squeeze(0)
-
-                            # Compute the attention loss
-                            if cfg.has_loss_component("attention"):
-                                if attention_map_bin is not None:
-                                    batch_loss["attention"] += Losses.attention_loss(attention_map_bin, pairs1, pairs2, target)
-
-                            # Compute the full attention loss (treat all non-positive pairs as negatives)
-                            if cfg.has_loss_component("full_attention"):
-                                if attention_map_bin is not None:
-                                    batch_loss["full_attention"] += Losses.full_attention_loss(
-                                        attention_map_bin, pairs1, pairs2, target
-                                    )
-
-                            # Compute the top-k attention loss
-                            if cfg.has_loss_component("topk_attention"):
-                                if attention_map_bin is not None:
-                                    batch_loss["topk_attention"] += Losses.top_attention_loss(
-                                        attention_map_bin, pairs1, pairs2, target
-                                    )
-
-                            # Compute the attention next loss (sequential pairs with cross-entropy)
-                            if cfg.has_loss_component("attention_next"):
-                                if attention_map_bin is not None:
-                                    batch_loss["attention_next"] += Losses.attention_next_loss(
-                                        attention_map_bin, pairs1, pairs2, target
-                                    )
-                            # Compute the attention backward loss (sequential pairs with cross-entropy)
-                            if cfg.has_loss_component("attention_back"):
-                                if attention_map_bin is not None:
-                                    batch_loss["attention_back"] += Losses.attention_backward_loss(
-                                        attention_map_bin, pairs1, pairs2, target
-                                    )
-
-                            num_valid_bins += 1
-
-                        # Consolidate losses: sum into total, log components, and accumulate weighted grads
-                        for key, value in batch_loss.items():
-                            if key == "total":
-                                continue
-                            event_losses[key] += value.detach()
-                            batch_loss["total"] += value
-                            if status == "Training":
-                                accumulated_loss = accumulated_loss + cfg.get_loss_weight(key) * value
-
-                        # Check for NaN/Inf loss
-                        if torch.isnan(accumulated_loss) or torch.isinf(accumulated_loss):
-                            raise ValueError(
-                                f"Loss became NaN/Inf during training at epoch {epoch}, event {entry}, "
-                                f"file_idx {file_idx}, batch bins {batch_bin_indices}"
-                            )
-
-                        event_losses["total"] += batch_loss["total"].detach()
-
-                        # Apply gradients once per batch of bins (for training)
-                        if status == "Training":
-                            optimiser.zero_grad()
-                            accumulated_loss.backward()
-                            optimiser.step()
-                            accumulated_loss = torch.tensor(0.0, device=cfg.device_acc, requires_grad=True)
-
-                # Average the losses across valid bins
-                if num_valid_bins > 0:
-                    for key in event_losses.keys():
-                        event_losses[key] = event_losses[key] / num_valid_bins
-
+                    if torch.isnan(total_loss) or torch.isinf(total_loss):
+                        raise ValueError(
+                            f"Loss became NaN/Inf at epoch {epoch}, "
+                            f"file_idx {file_idx}, event_idx {event_idx}"
+                        )
+                    
+                    if status == "Training":
+                        total_loss.backward()
+                        optimiser.step()
+                        
+                        if scheduler is not None:
+                            scheduler.step()
+                
                 if writer:
-                    # Log gradients once per event for training
-                    # if status == "Training":
-                    #     Utils.log_gradients(model, writer, epoch * nb_events + entry)
+                    step = epoch * nb_events + entry
 
-                    # write per-event losses
-                    for key, value in event_losses.items():
+                    for key, value in event_loss_log.items():
                         writer.add_scalar(
                             f"loss_components/{key}/{status}",
                             value.item(),
-                            epoch * nb_events + entry,
+                            step,
                         )
 
-                    # write learning rate
-                    if optimiser and scheduler:
+                    if optimiser is not None:
                         writer.add_scalar(
-                            "learning_rate/{}".format(status),
+                            f"learning_rate/{status}",
                             optimiser.param_groups[0]["lr"],
-                            epoch * nb_events + entry,
+                            step,
                         )
-
-                    entry += 1
-
-                # Track event loss for epoch averaging
+                    
                 if status == "Training":
-                    epoch_train_losses.append(event_losses["total"].item())
+                    epoch_train_losses.append(event_loss_log["total"].item())
                 else:
-                    epoch_val_losses.append(event_losses["total"].item())
+                    epoch_val_losses.append(event_loss_log["total"].item())
 
-        # Compute and log epoch-level average losses
-        if epoch_train_losses:
+                entry += 1
+
+        if epoch_train_losses: # if list is not empty
             avg_train_loss = sum(epoch_train_losses) / len(epoch_train_losses)
-            ts_print(f"Epoch {epoch} - Average Training Loss: {avg_train_loss:.6f} ({len(epoch_train_losses)} events)")
+            ts_print(
+                f"Epoch {epoch} - Average Training Loss: "
+                f"{avg_train_loss:.6f} ({len(epoch_train_losses)} events)"
+            )
+
             if writer:
                 writer.add_scalar("loss_epoch/Training", avg_train_loss, epoch)
-
+            
         if epoch_val_losses:
             avg_val_loss = sum(epoch_val_losses) / len(epoch_val_losses)
-            ts_print(f"Epoch {epoch} - Average Validation Loss: {avg_val_loss:.6f} ({len(epoch_val_losses)} events)")
-            if writer:
-                writer.add_scalar("loss_epoch/Validation", avg_val_loss, epoch)
+            ts_print(
+                f"Epoch {epoch} - Average Validation Loss: "
+                f"{avg_val_loss:.6f} ({len(epoch_val_losses)} events)"
+            )
 
-        # Save backup checkpoint every 10 epochs
+            if writer:
+                writer.add_scalar("loss_epoch/Validation", avg_val_loss, epoch)           
+        
         if (epoch + 1) % 10 == 0:
-            backup_path = cfg.model_path.replace(".pt", f"_backup_epoch_{epoch + 1}.pt")
+            backup_path = cfg.model_path.replace(
+                ".pt",
+                f"_backup_epoch_{epoch + 1}.pt",
+            )
+
             model.save(
                 epoch=epoch,
                 path=backup_path,
                 optimizer=optimiser,
                 scheduler=scheduler,
             )
-            print(f"Saved backup checkpoint to {backup_path}")
-        if optimiser and scheduler:
-            scheduler.step()
 
+            print(f"Saved backup checkpoint to {backup_path}")           
+                    
     return model
 
 
@@ -336,32 +308,40 @@ def run_model(
     model: SeedTransformer,
     hits_tensor: torch.Tensor,
     padding_mask: torch.Tensor,
+    hit_to_particle_tensor: torch.Tensor,
     cfg: SeedConfig,
 ) -> tuple:
-    """Run inference over files and return per-bin artifacts.
+    """Run inference for one event and reconstruct seeds using top-k attention.
 
-    Performs a forward pass (embedding + attention + dummy regression) and then executes
-    a lightweight seed reconstruction on the CPU for every valid bin of each processed
-    event. Outputs are kept as Python/NumPy containers to reduce peak memory usage.
-
-    Returns (nested lists; indexing is [event_idx][bin_idx]):
-        - seeds: Reconstruction seeds (list of seed tuples per bin). Each seed is a
-          tuple (hit_indices: np.ndarray, avg_params: np.ndarray). Empty bins yield [].
-        - hit_scores: per-bin np.ndarray[n_valid_hits] of hit scores (padding removed), or None.
-        - attention_maps: per-bin np.ndarray[num_valid_hits, num_valid_hits] used for seeding, or None.
+    Expected input shapes for one event:
+    
+        hits_tensor:
+            [1, max_hit_input, num_features]
+            
+        padding_mask:
+            [1, max_hit_input]
+            True = padding
+            False = not padding
+        
+        hit_to_particle_tensor:
+            [1, max_hit_input, 1] or [1, max_hit_input]
+            particle_id >= 0 : real particle hit
+            particle_id == -1: orphan hit
+            particle_id == -2: padding hit
+        
+    Returns:
+        - event_seeds: list indexed by bin index. Since there is only one bin per event, we only get event_seeds[0].
+        - event_hit_scores: list indexed by bin index. In Dune case, this is None.
+        - event_attention_maps: list indexed by bin index. Stores the sigmoid attention map restricted to real particle hits.
+        - timing values: event_duration, transformer_duration, regression_duration, seed_reconstruction_duration.
     """
-
+    
+    
     event_duration = 0.0
     transformer_duration = 0.0
     regression_duration = 0.0
     seed_reconstruction_duration = 0.0
 
-    # Initialize speed monitoring
-    # Use high-resolution clock; sync once to avoid overlapping prior kernels
-    if cfg.timing_enabled:
-        Utils.sync_device(cfg.device_acc)
-
-    # for event_idx in range(min(num_events_in_batch, 20)):
     if cfg.timing_enabled:
         Utils.sync_device(cfg.device_acc)
         event_start_time = time.perf_counter()
@@ -370,16 +350,40 @@ def run_model(
     event_hit_scores: List[Optional[np.ndarray]] = []
     event_attention_maps: List[Optional[np.ndarray]] = []
 
+    # Safety checks
+    if hits_tensor.dim() != 3:
+        raise ValueError(
+            f"Expected hits_tensor with shape [1, max_hit_input, num_features], "
+            f"but got shape {tuple(hits_tensor.shape)}"
+        )
+        
+    if padding_mask.dim() != 2:
+        raise ValueError(
+            f"Expected padding_mask with shape [1, max_hit_input],"
+            f"but got shape {tuple(padding_mask.shape)}"
+        )
+        
+    if hit_to_particle_tensor.dim() == 3:
+        hit_to_particle_flat = hit_to_particle_tensor[..., 0] # converts [1, max_hit_input, 1] to [1, max_hit_input]
+    elif hit_to_particle_tensor.dim() == 2:
+        hit_to_particle_flat = hit_to_particle_tensor
+    else:
+        raise ValueError(
+            f"Expected hit_to_particle_tensor with shape [1, max_hit_input, 1],"
+            f"or [1, max_hit_input], but got shape {tuple(hit_to_particle_tensor.shape)}"
+        )
+    
     with torch.inference_mode():
         # Timing: Transformer inference (encoding + attention)
         if cfg.timing_enabled:
             Utils.sync_device(cfg.device_acc)
             t0 = time.perf_counter()
 
-        hits_tensor = hits_tensor.to(cfg.device_acc, dtype=model.dtype)
+        hits_tensor_gpu = hits_tensor.to(cfg.device_acc, dtype=model.dtype)
+        padding_mask_gpu = padding_mask.to(cfg.device_acc, dtype=torch.bool)
 
         # Obtain encoded embeddings and attention weights from the model
-        encoded_space_point, attention_weights = model(hits_tensor, padding_mask)
+        encoded_space_point, attention_weights = model(hits_tensor_gpu, padding_mask_gpu)
 
         if cfg.timing_enabled:
             Utils.sync_device(cfg.device_acc)
@@ -390,12 +394,7 @@ def run_model(
             Utils.sync_device(cfg.device_acc)
             r0 = time.perf_counter()
 
-        if cfg.transformer_config.regression:
-            hit_score = encoded_space_point
-
-        else:
-            # Compute hit score as the row-wise max of the attention weights [bins, hits, 1]
-            hit_score = attention_weights.squeeze(1).max(dim=-1).values.unsqueeze(-1)
+        hit_score = None
 
         if cfg.timing_enabled:
             Utils.sync_device(cfg.device_acc)
@@ -406,110 +405,62 @@ def run_model(
         Utils.sync_device(cfg.device_acc)
         seed_reconstruction_start = time.perf_counter()
 
-    all_bin_masks_cpu = (~padding_mask.bool()).detach().cpu()
-    hits_tensor_cpu = hits_tensor.detach().cpu()
+    padding_mask_cpu = padding_mask.detach().cpu().bool()
+    hit_to_particle_cpu = hit_to_particle_flat.detach().cpu()
     attention_weights_cpu = attention_weights.detach().cpu()
-
-    for bin_idx in range(hits_tensor.shape[0]):
-        bin_mask_cpu = all_bin_masks_cpu[bin_idx]
-        if not bin_mask_cpu.any():
+    
+    num_bins = hits_tensor.shape[0] # 1
+    
+    for bin_idx in range(num_bins):
+        padding_bin = padding_mask_cpu[bin_idx]
+        particle_bin = hit_to_particle_cpu[bin_idx]
+        
+        valid_hit_mask = (~padding_bin) & (particle_bin >= 0)
+        
+        if not valid_hit_mask.any():
+            event_seeds.append([])
             event_hit_scores.append(None)
             event_attention_maps.append(None)
-            event_seeds.append([])
             continue
-
-        # Get valid hit data for this bin
-        valid_score_full = hit_score[bin_idx].cpu().detach()  # [max_hit_input, 1] — unmasked
-        valid_attention_weights = attention_weights_cpu[bin_idx].squeeze(0)
-
-        # Mask hit scores to valid hits only for reconstruction functions
-        valid_score = valid_score_full[bin_mask_cpu.view(-1)]  # [n_valid, 1]
-
-        event_hit_scores.append(valid_score.squeeze(-1).float().numpy())
-
-        # Extract attention weights for this bin from single layer
-        if valid_attention_weights is not None:
-
-            # Apply masking for valid hits only
-            neighbor_matrix_masked = valid_attention_weights[bin_mask_cpu, :][:, bin_mask_cpu]
-
-            # Determine reconstruction method: explicit config takes priority,
-            # otherwise auto-select from the active loss components.
-            reco_method = cfg.reconstruction_method
-            if reco_method is None:
-                if cfg.has_loss_component("attention_next"):
-                    reco_method = "chained"
-                elif cfg.has_loss_component("attention_back"):
-                    reco_method = "back_chained"
-                else:
-                    reco_method = "topk"
-
-            if reco_method == "chained":
-                neighbor_matrix_masked.fill_diagonal_(float("-inf"))
-                neighbor_matrix_masked = torch.softmax(neighbor_matrix_masked, dim=-1)
-                bin_seeds = Reconstruction.chained_seed_reconstruction(
-                    neighbor_matrix_masked,
-                    valid_score,
-                    score_threshold=0.2,
-                    max_chain_length=5,
-                )
-            elif reco_method == "back_chained":
-                neighbor_matrix_masked.fill_diagonal_(float("-inf"))
-                neighbor_matrix_masked = torch.softmax(neighbor_matrix_masked, dim=-1)
-                bin_seeds = Reconstruction.back_chained_seed_reconstruction(
-                    neighbor_matrix_masked,
-                    valid_score,
-                    score_threshold=0.2,
-                    max_chain_length=5,
-                )
-            elif reco_method == "weighted_chained":
-                neighbor_matrix_masked.fill_diagonal_(float("-inf"))
-                neighbor_matrix_masked = torch.softmax(neighbor_matrix_masked, dim=-1)
-                bin_seeds = Reconstruction.weighted_chained_seed_reconstruction(
-                    neighbor_matrix_masked,
-                    valid_score,
-                    score_threshold=0.0,
-                    max_chain_length=5,
-                    pairs_per_hit=2,
-                )
-            elif reco_method == "beam_search":
-                neighbor_matrix_masked.fill_diagonal_(float("-inf"))
-                neighbor_matrix_masked = torch.softmax(neighbor_matrix_masked, dim=-1)
-                valid_hits = hits_tensor_cpu[bin_idx][bin_mask_cpu]  # [num_valid, num_features]
-                starting_mask = (valid_hits[:, 3] < 500) & (valid_hits[:, 2].abs() < 600)  # r<100, |z|<500
-                bin_seeds = Reconstruction.beam_search_seed_reconstruction(
-                    neighbor_matrix_masked,
-                    valid_score,
-                    starting_mask=starting_mask,
-                    score_threshold=0.0,
-                    max_chain_length=5,
-                    beam_width=5,
-                )
-            else:  # topk
-                neighbor_matrix_masked = torch.sigmoid(neighbor_matrix_masked)
-                bin_seeds = Reconstruction.topk_seed_reconstruction(
-                    neighbor_matrix_masked,
-                    valid_score,
-                    threshold=0.8,
-                    max_selection=5,
-                )
-            event_seeds.append(bin_seeds)
-
-            # Apply softmax row-wise to attention weights for monitoring
-            attention_softmax = torch.softmax(valid_attention_weights, dim=-1)
-            event_attention_maps.append(attention_softmax.cpu().detach().float().numpy())
-        else:
-            # No attention weights or pairwise scores available - append placeholder to keep alignment
-            event_seeds.append([])
-            event_attention_maps.append(None)
-
-    # End seed reconstruction timing
+        
+        attention_bin = attention_weights_cpu[bin_idx]
+        
+        attention_bin = attention_bin.squeeze()
+        
+        if attention_bin.dim() == 3:
+            attention_bin = attention_bin.mean(dim=0)
+        
+        if attention_bin.dim() != 2:
+            raise ValueError(
+                f"Expected attention_bin to become 2D, but got shape "
+                f"{tuple(attention_bin.shape)}"
+            )
+            
+        neighbor_matrix = torch.sigmoid(attention_bin)
+        
+        max_selection = getattr(cfg, "max_selection", 5)
+        
+        bin_seeds = topk_seed_reconstruction(
+            attention_map=neighbor_matrix, # the attention matrix after sigmoid
+            hit_to_particle=particle_bin, # shape [5000]
+            max_selection=max_selection, # how many top neighbors to select for each hit
+        )
+        
+        event_seeds.append(bin_seeds)
+        event_hit_scores.append(None)
+        attention_valid = neighbor_matrix[valid_hit_mask, :][:, valid_hit_mask]
+        
+        event_attention_maps.append(
+            attention_valid.detach().float().numpy()
+        )
+    
     if cfg.timing_enabled:
         Utils.sync_device(cfg.device_acc)
-        seed_reconstruction_end = time.perf_counter()
-        seed_reconstruction_duration = seed_reconstruction_end - seed_reconstruction_start
+        seed_reconstruction_duration = (
+            time.perf_counter() - seed_reconstruction_start
+        )
         event_duration = time.perf_counter() - event_start_time
-
+        
     return (
         event_seeds,
         event_hit_scores,
@@ -519,7 +470,7 @@ def run_model(
         regression_duration,
         seed_reconstruction_duration,
     )
-
+    
 
 def main():
     """
@@ -548,7 +499,7 @@ def main():
         dtype=cfg.transformer_config.dtype,
     )
     model.to(cfg.device_acc)
-    # Create optimizer right now we are using AdamW as it seem to perform well with transformer models
+    # Create optimizer right now we are using AdamW as it seems to perform well with transformer models
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     # Create learning rate scheduler with cosine annealing and minimum learning rate
     scheduler = Utils.create_cosine_schedule_with_min_lr(
@@ -575,10 +526,8 @@ def main():
     # Load the existing dataset (force_recreate=False will load existing files)
     tensor_list = {
         "hits_tensor",
-        "particles_tensor",
         "hit_to_particle_tensor",
         "padding_mask",
-        "good_pairs",
     }
     dataset = DataLoader(
         dataset_dir=cfg.input_tensor_path,
@@ -586,8 +535,6 @@ def main():
         tensor_names=list(tensor_list),
         device=cfg.device_acc,
     )
-
-    train_size = dataset.get_batch_size(0, len(dataset) - 1)
 
     # Split the dataset at the file level to ensure proper train/test separation
     num_files = dataset.get_file_number()
@@ -599,6 +546,12 @@ def main():
     # Create file-based train and test indices
     train_file_indices = list(range(train_files))
     test_file_indices = list(range(train_files, num_files))
+    
+    if train_files == 0:
+        raise ValueError("No training files selected. Reduce cfg.test_fraction.")
+
+    
+    train_size = dataset.get_batch_size(0, train_files - 1)
 
     # Keep training file order deterministic (no shuffling)
     if cfg.epoch_nb > 0:
@@ -634,8 +587,8 @@ def main():
         # Calculate the total number of training events across all training files
         ts_print(f"Training on {train_size} events across {len(train_file_indices)} files")
         # Very important: compile the model
-        if cfg.device_acc != "mps":
-            model = torch.compile(model)
+        # if cfg.device_acc.type != "mps":
+        #     model = torch.compile(model)
         # Train the model
         ts_print("Starting training of the model")
         model = train_model(
@@ -643,7 +596,6 @@ def main():
             train_file_indices,
             dataset,
             train_size,
-            cfg.batch_size,
             cfg,
             writer,
             opt,
@@ -676,7 +628,7 @@ def main():
         dtype=cfg.transformer_config.dtype,
     )
 
-    if cfg.no_test:
+    if cfg.no_test or len(test_file_indices) == 0:
         ts_print("Skipping evaluation")
         return
 
@@ -687,8 +639,8 @@ def main():
     model_val.to(cfg.device_acc)
     model_val = model_val.to(cfg.transformer_config.dtype)
     model_val.eval()
-    if cfg.device_acc != "mps":
-        model_val = torch.compile(model_val)
+    # if cfg.device_acc.type != "mps":
+    #     model_val = torch.compile(model_val)
 
     # Perform validation using test_file_indices
     print("Starting model evaluation with test dataset...")
@@ -700,16 +652,13 @@ def main():
     start_event = 0
     event_counter = 0
 
-    event_idx_list = [0]
-    bin_idx_list = [55]
-
-    monitoring = PerformanceMonitor(
-        full_print=False,
-        save_plots=True,
-        min_common_hits=3,
-        min_truth_hits=3,
-        truth_r_tol=1e-3,
-    )
+    # monitoring = PerformanceMonitor(
+    #     full_print=False,
+    #     save_plots=True,
+    #     min_common_hits=3,
+    #     min_truth_hits=3,
+    #     truth_r_tol=1e-3,
+    # )
 
     for file_idx in test_file_indices:
         batch_data = dataset.get_file(file_idx)
@@ -726,7 +675,7 @@ def main():
                 batch_transformer_times,
                 batch_regression_times,
                 batch_seed_reconstruction_times,
-            ) = run_model(model_val, batch_data["hits_tensor"][event_idx], batch_data["padding_mask"][event_idx], cfg)
+            ) = run_model(model_val, batch_data["hits_tensor"][event_idx], batch_data["padding_mask"][event_idx], batch_data["hit_to_particle_tensor"][event_idx], cfg)
             total_time += time.perf_counter() - start_time if cfg.timing_enabled else 0.0
 
             # Accumulate timings for speed summary
@@ -740,31 +689,11 @@ def main():
                 del batch_regression_times
                 del batch_seed_reconstruction_times
 
-            if event in event_idx_list:
-                for bin_idx in bin_idx_list:
-                    monitoring.analyse_bin_performance(
-                        event_idx=event_idx,
-                        bin_idx=bin_idx,
-                        hits=batch_data["hits_tensor"][event_idx][bin_idx].cpu().float().numpy(),
-                        particles=batch_data["particles_tensor"][event_idx].cpu().float().numpy(),
-                        seeds=batch_seeds[bin_idx],
-                        pairs=batch_data["good_pairs"][event_idx][bin_idx].cpu().float().numpy(),
-                        attention_map=batch_attention_maps[bin_idx],
-                    )
-
-            monitoring.bin_seeding_performance(
-                event_idx=event_idx,
-                event_hits=batch_data["hits_tensor"][event_idx].cpu().float().numpy(),
-                event_particles=batch_data["particles_tensor"][event_idx].cpu().float().numpy(),
-                event_hit_to_particle=batch_data["hit_to_particle_tensor"][event_idx].cpu().float().numpy(),
-                event_seeds=batch_seeds,
-                event_hit_scores=batch_hit_scores,
-            )
 
         start_event = end_event
 
     print("Model evaluation completed.")
-    monitoring.performance_analysis()
+    #monitoring.performance_analysis()
 
     # Final speed summary with component breakdown
     if cfg.timing_enabled:

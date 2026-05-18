@@ -43,17 +43,18 @@ class PreprocessingConfig:
         self.dataset_name = "seeding_data"  # Base name for dataset files
 
         # Processing parameters
-        self.events_per_file = 100  # Maximum number of events per output tensor file
+        self.events_per_file = 220 # Maximum number of events per output tensor file
         self.max_events = -1  # Maximum number of events to process (-1 for all events)
 
         # Orphan hit removal
         self.orphan_hit_fraction = 0.0  # Fraction of orphan hits to remove (0.0 to 1.0)
 
         # Binning parameters
-        self.binning_strategy = "neighbor"  # Binning strategy: 'no_bin', 'global', 'neighbor', or 'margin'
+        self.binning_strategy = "no_bin"  # Binning strategy: 'no_bin', 'global', 'neighbor', or 'margin'
         self.bin_width = 0.05  # Width of bins for binning in phi
         self.binning_margin = 0.01  # Margin for margin binning strategy (fraction of bin_width)
-        self.max_hit_input = 1200  # Maximum number of hits per bin
+        self.max_hit_input = 5000  # Maximum number of hits per bin (p90: 4373, p95: 4945)
+
 
         # Selection parameters
         self.eta_range = [-3.0, 3.0]  # Eta range for particle selection [min, max]
@@ -68,7 +69,7 @@ class PreprocessingConfig:
         self.pv_pair_weight = 10  # Weight for primary-vertex (PV) particle pairs in training
 
         # Parallelism
-        self.num_workers = 1  # Number of parallel worker processes for batch processing
+        self.num_workers = 1  # Number of parallel worker processes for batch processing. 
 
     def add_args(self, parser: argparse.ArgumentParser) -> None:
         """

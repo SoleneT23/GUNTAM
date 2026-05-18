@@ -8,100 +8,15 @@ import pandas as pd
 import numpy as np
 import torch
 
-from GUNTAM.Transformer.BinTensor import global_bin, neighbor_bin, no_bin, margin_bin
+from GUNTAM.Transformer.BinTensor import no_bin
 from GUNTAM.IO.PreprocessingConfig import PreprocessingConfig
 
 import h5py
 
 
-def _particle_selection(
-    data_batch: pd.DataFrame, particles_batch: pd.DataFrame, bins: pd.DataFrame, hit_to_particle: pd.Series, cfg
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
-    """
-    Select particles the parameters in the config file
-
-    Args:
-        data_batch: DataFrame containing the hit data for a batch of events, must have 'event_id' column.
-        particles_batch: DataFrame containing the particle data for a batch of events, must have 'event_id' column.
-        bins: DataFrame containing the bin indices for each hit, must have 'bin0', 'bin1', 'bin2' columns.
-        hit_to_particle: Series containing the mapping from hits to particles, indexed the same as data_batch.
-        cfg: Configuration object containing parameters for particle selection, specifically cfg.eta_range.
-
-    Returns:
-        Tuple of (data_batch, particles_batch, bins, hit_to_particle) where:
-        - data_batch: Filtered DataFrame containing only hits associated with selected particles.
-        - particles_batch: Filtered DataFrame containing only particles within the eta range.
-        - bins: Filtered DataFrame containing bin indices for the remaining hits.
-        - hit_to_particle: Filtered Series containing the mapping for the remaining hits.
-    """
-
-    # Select the particle in the eta range
-    eta_range = cfg.eta_range
-    mask = (
-        (particles_batch["eta"] >= eta_range[0])
-        & (particles_batch["eta"] <= eta_range[1])
-        & (particles_batch["pT"] > 0)
-        & (particles_batch["d0"] < cfg.vertex_cuts[0])
-        & (particles_batch["z0"].abs() < cfg.vertex_cuts[1])
-    )
-    particles_batch = particles_batch[mask].reset_index(drop=True)
-
-    # Using the hit_to_particle mapping, reclassify hits from removed particles as orphans
-    valid_particle_ids = set(particles_batch["particle_id"].unique())
-
-    # Reclassify hits from removed particles as orphans (particle_id = -1)
-    invalid_particle_mask = ~hit_to_particle.isin(valid_particle_ids) & (hit_to_particle != -1)
-    hit_to_particle.loc[invalid_particle_mask] = -1
-    data_batch.loc[invalid_particle_mask, "particle_id"] = -1
-
-    # Remap particle_id to sequential indices for each event
-    for event_id in particles_batch["event_id"].unique():
-        event_mask = particles_batch["event_id"] == event_id
-        event_particles = particles_batch[event_mask]
-
-        # Create mapping from old particle_id to new sequential index
-        old_ids = event_particles["particle_id"].values
-        particle_id_map = {old_id: new_idx for new_idx, old_id in enumerate(old_ids)}
-        particle_id_map[-1] = -1  # Keep -1 for orphan/padding hits
-
-        # Update particle_id in particles_batch to be sequential
-        particles_batch.loc[event_mask, "particle_id"] = range(len(event_particles))
-
-        # Update hit_to_particle mapping
-        hit_event_mask = data_batch["event_id"] == event_id
-        hit_to_particle.loc[hit_event_mask] = hit_to_particle.loc[hit_event_mask].map(lambda pid: particle_id_map.get(pid, -1))
-
-    return data_batch, particles_batch, bins, hit_to_particle
-
-
-def _hit_selection(data_batch: pd.DataFrame, cfg) -> pd.DataFrame:
-    """
-    Remove hits that fall outside the geometric acceptance defined by cfg.hit_range.
-
-    Args:
-        data_batch: DataFrame containing hit data.  Must have columns 'r' (transverse
-            radius) and 'z'.  Padding hits (particle_id == -2) are kept regardless.
-        cfg: Configuration object with a ``hit_range`` attribute
-            ``[R_max, Z_max]``.
-
-    Returns:
-        Filtered DataFrame with the index reset.
-    """
-    r_max, z_max = cfg.hit_range
-
-    # Keep padding hits (particle_id == -2) unconditionally
-    padding_mask = data_batch["particle_id"] == -2
-    geometric_mask = (data_batch["r"] <= r_max) & (data_batch["z"].abs() <= z_max)
-
-    return data_batch[padding_mask | geometric_mask].reset_index(drop=True)
-
-
 def _build_good_pairs_tensors(
     data_batch: pd.DataFrame,
-    bins: pd.DataFrame,
     hit_to_particle: pd.Series,
-    num_bins: int,
-    pv_weight: int = 10,
 ) -> torch.Tensor:
     """
     Build a tensor of all hit pairs and their labels (same particle or not) for a batch of events,
@@ -109,274 +24,348 @@ def _build_good_pairs_tensors(
 
     Args:
         data_batch: DataFrame containing the hit data for a batch of events, must have 'event_id' column.
-        bins: DataFrame containing the bin indices for each hit, must have 'bin0', 'bin1', 'bin2' columns.
-        hit_to_particle: Series containing the mapping from hits to particles, indexed the same as data_batch.
-        num_bins: Total number of bins used in the binning strategy.
+        hit_to_particle: Series containing the mapping from hits to particles, indexed the same as data_batch. It is given by the _process_single_batch() below.
+
     Returns:
-        A PyTorch tensor of shape [num_events, num_bins, num_pairs, 3] where each pair is represented as
+        A PyTorch tensor of shape [num_events, num_bins=1, num_pairs, 3] where each pair is represented as
         (hit_idx1, hit_idx2, label) and label is 1 if the hits belong to the same particle.
     """
-    print("    Building good pairs tensor...")
-    unique_events = data_batch["event_id"].unique()
-    unique_bins = bins["bin1"].unique()
-    bin_only = bins[["bin0", "bin1", "bin2"]]
-    global_bin_mask = []
-    for bin_id in range(max(unique_bins) + 1):
-        mask = bin_only.eq(bin_id).any(axis=1)
-        global_bin_mask.append(mask)
-
-    # Collect all pairs organized by event and bin
-    all_pairs_by_event_bin: Dict[int, Dict[int, np.ndarray]] = {}
-    max_pairs_per_bin = 0
+    print("    Building good pairs tensor (one bin per event)...")
+    
+    unique_events = sorted(data_batch["event_id"].unique())
+    
+    # Collect all pairs organized by event
+    all_pairs_by_event: Dict[int, np.ndarray] = {}
+    max_pairs = 0
 
     for event_id in unique_events:
         event_mask = data_batch["event_id"] == event_id
-        all_pairs_by_event_bin[event_id] = {}
+        event_hits = data_batch[event_mask] # subset of full dataframe, only one event
+        
+        event_particle_ids = hit_to_particle.loc[event_hits.index].to_numpy()
+        n_hits = len(event_hits) # counts how many hits are in the event, defines how many possible pairs
 
-        for bin_id in range(max(unique_bins) + 1):
-            # Get all hits in this bin for this event
-            bin_mask = global_bin_mask[bin_id] & event_mask
-            bin_hit_indices = data_batch[bin_mask].index
-            bin_hit_indices_array = bin_hit_indices.to_numpy()
-            bin_particle_ids = hit_to_particle.loc[bin_hit_indices_array].values
-            n_hits = len(bin_hit_indices_array)
-            if n_hits > 0:
-                # Create all combinations using broadcasting
-                i_indices = np.arange(n_hits)[:, None]  # Shape (n_hits, 1)
-                j_indices = np.arange(n_hits)[None, :]  # Shape (1, n_hits)
-                # Create masks for valid pairs
-                not_self_mask = i_indices != j_indices
-                same_particle_mask = bin_particle_ids[i_indices] == bin_particle_ids[j_indices]
-                # Exclude orphan hits (particle_id == -1) from pair construction
-                not_orphan_mask = (bin_particle_ids[i_indices] != -1) & (bin_particle_ids[j_indices] != -1)
-                valid_mask = not_self_mask & same_particle_mask & not_orphan_mask
+        if n_hits > 0:
+            i_indices = np.arange(n_hits)[:, None]
+            j_indices = np.arange(n_hits)[None, :]
 
-                # Get valid pair indices
-                i_valid, j_valid = np.where(valid_mask)
+            not_self_mask = i_indices != j_indices
+            same_particle_mask = event_particle_ids[i_indices] == event_particle_ids[j_indices] # builds a nhits x nhits boolean matrix
 
-                # Create pairs array: (hit_idx1, hit_idx2, label) using bin-relative indices
-                # Label is pv_weight for primary-vertex (PV) particle pairs, 1 otherwise
-                if len(i_valid) > 0:
-                    pv_col = "particle_id_pv"
-                    if pv_col in data_batch.columns:
-                        pv_flags = data_batch.loc[bin_hit_indices_array, pv_col].values == 1
-                        is_pv_pair = pv_flags[i_valid]
-                        labels = np.where(is_pv_pair, pv_weight, 1).astype(np.int64)
-                    else:
-                        labels = np.ones(len(i_valid), dtype=np.int64)
-                    pairs = np.stack([i_valid, j_valid, labels], axis=1)
-                else:
-                    pairs = np.empty((0, 3), dtype=np.int64)
+            # Exclude orphans (-1) and padding (-2)
+            valid_particle_mask = (
+                (event_particle_ids[i_indices] >= 0) &
+                (event_particle_ids[j_indices] >= 0)
+            )
+
+            valid_mask = not_self_mask & same_particle_mask & valid_particle_mask
+            
+            i_valid, j_valid = np.where(valid_mask) # indices of valid pairs
+            
+            if len(i_valid) > 0:
+                labels = np.ones(len(i_valid), dtype=np.int64)
+                pairs = np.stack([i_valid, j_valid, labels], axis=1)
             else:
                 pairs = np.empty((0, 3), dtype=np.int64)
-
-            all_pairs_by_event_bin[event_id][bin_id] = pairs
-            max_pairs_per_bin = max(max_pairs_per_bin, len(pairs))
-
-    # Convert to tensor with shape [num_events, num_bins, max_pairs_per_bin, 3]
+        else:
+            pairs = np.empty((0, 3), dtype=np.int64)
+            
+        all_pairs_by_event[event_id] = pairs
+        max_pairs = max(max_pairs, len(pairs))
+        
     num_events = len(unique_events)
-    pairs_tensor = torch.zeros((num_events, num_bins, max_pairs_per_bin, 3), dtype=torch.long)
+    pairs_tensor = torch.zeros((num_events, 1, max_pairs, 3), dtype=torch.long) # num_bins = 1
 
-    for event_idx, event_id in enumerate(sorted(unique_events)):
-        for bin_id in range(max(unique_bins) + 1):
-            pairs = all_pairs_by_event_bin[event_id][bin_id]
-            if len(pairs) > 0:
-                pairs_tensor[event_idx, bin_id, : len(pairs), :] = torch.tensor(pairs, dtype=torch.long)
+    for event_idx, event_id in enumerate(unique_events):
+        pairs = all_pairs_by_event[event_id]
+        if len(pairs) > 0:
+            pairs_tensor[event_idx, 0, :len(pairs), :] = torch.tensor(pairs, dtype=torch.long)
 
     return pairs_tensor
 
 
+def build_positive_pairs_from_particle_ids(
+    particle_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build all positive pairs from particle ids.
+    
+    Args:
+        particle_ids: Tensor of shape [max_hit_input] or [max_hit_input, 1]
+        
+    Returns:
+        pairs1: [N_pos]
+        pairs2: [N_pos]
+        target: [N_pos] all ones
+    """
+    if particle_ids.dim() == 2:
+        particle_ids = particle_ids.squeeze(-1)
+    
+    device = particle_ids.device
+    
+    valid_mask = particle_ids >= 0
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1) # indices of valid real hits
+
+    if valid_indices.numel() == 0:
+        empty_long = torch.empty(0, dtype=torch.long, device=device)
+        empty_float = torch.empty(0, dtype=torch.float32, device=device)
+        return empty_long, empty_long, empty_float
+    
+    valid_particle_ids = particle_ids[valid_indices] 
+    
+    pairs1_list = []
+    pairs2_list = []
+    
+    unique_particles = torch.unique(valid_particle_ids) # which particles exist in this event
+    
+    for pid in unique_particles:
+        hit_indices = valid_indices[valid_particle_ids == pid]
+        
+        n = hit_indices.numel()
+        
+        if n < 2:
+            continue
+        
+        # Generate every possible ordered pairs of hits for one particle
+        i = hit_indices.repeat_interleave(n)
+        j = hit_indices.repeat(n)
+        
+        not_self = i!=j
+        
+        pairs1_list.append(i[not_self])
+        pairs2_list.append(j[not_self])
+        
+    if len(pairs1_list) == 0:
+        empty_long = torch.empty(0, dtype=torch.long, device=device)
+        empty_float = torch.empty(0, dtype=torch.float32, device=device)
+        return empty_long, empty_long, empty_float
+    
+    pairs1 = torch.cat(pairs1_list)
+    pairs2 = torch.cat(pairs2_list)
+    target = torch.ones(pairs1_list.shape[0], dtype = torch.float32, device = device)
+    
+    return pairs1, pairs2, target
+    
+    
+def sample_positive_pairs_from_particle_ids(
+    particle_ids: torch.Tensor,
+    max_positive_pairs: int = 100_000,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sample positive pairs from particle ids.
+    
+    Args:
+        particle_ids: Tensor of shape [max_hit_input] or [max_hit_input,1]
+        max_positive_pairs: maximum number of positive pairs to return per event
+        
+    Returns:
+        pairs1: [N_pos]
+        pairs2: [N_pos]
+        target: [N_pos], all ones 
+        all tensors have size at most max_positive_pairs
+    """
+    if particle_ids.dim() == 2:
+        particle_ids = particle_ids.squeeze(-1)
+    
+    device = particle_ids.device
+    
+    valid_mask = particle_ids >= 0
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+    
+    if valid_indices.numel() == 0:
+        empty_long = torch.empty(0, dtype=torch.long, device=device)
+        empty_float = torch.empty(0, dtype=torch.float32, device=device)
+        return empty_long, empty_long, empty_float
+        
+    valid_particle_ids = particle_ids[valid_indices]
+    unique_particles = torch.unique(valid_particle_ids)
+    
+    pairs1_list = []
+    pairs2_list = []
+    
+    counts = []
+    
+    for pid in unique_particles:
+        n = (valid_particle_ids == pid).sum().item()
+        if n >= 2: 
+            counts.append((pid, n, n*(n-1)))
+        
+    total_possible_pairs = sum(x[2] for x in counts)
+    
+    if total_possible_pairs == 0:
+        empty_long = torch.empty(0, dtype=torch.long, device=device)
+        empty_float = torch.empty(0, dtype=torch.float32, device=device)
+        return empty_long, empty_long, empty_float
+    
+    for pid, n, num_pairs_pid in counts:
+        hit_indices = valid_indices[valid_particle_ids == pid]
+        
+        k_pid = int(max_positive_pairs*num_pairs_pid / total_possible_pairs)
+        k_pid = max(k_pid, 1)
+        
+        idx1 = torch.randint(0, n, (k_pid,), device=device)
+        idx2 = torch.randint(0, n, (k_pid,), device=device)
+        
+        same = idx1 == idx2
+        while same.any():
+            idx2[same] = torch.randint(0, n, (same.sum().item(),), device=device)
+            same = idx1 == idx2
+
+        pairs1_list.append(hit_indices[idx1])
+        pairs2_list.append(hit_indices[idx2])
+    
+    pairs1 = torch.cat(pairs1_list)
+    pairs2 = torch.cat(pairs2_list)
+
+    if pairs1.numel() > max_positive_pairs:
+        perm = torch.randperm(pairs1.numel(), device=device)[:max_positive_pairs]
+        pairs1 = pairs1[perm]
+        pairs2 = pairs2[perm]
+        
+    target = torch.ones(pairs1.shape[0], dtype=torch.float32, device=device)
+    
+    return pairs1.long(), pairs2.long(), target
+
+        
 def _to_tensor(
     data_batch: pd.DataFrame,
-    particles_batch: pd.DataFrame,
-    bins: pd.DataFrame,
     hit_to_particle: pd.Series,
     hit_features: List[str],
-    particle_features: List[str],
-    num_bins: int,
-    max_hits_per_bin: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_hits_per_event: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Keep only feature of interest then convert the hits, particles, and hit_to_particle map into PyTorch tensors.
+    Convert hit data and hit-to-particle mapping into PyTorch tensors. 
+    We keep a dummy bin dimension of size 1 for compatibility with Train.py.
+    
     Args:
     data_batch: DataFrame containing the hit data for a batch of events, must have 'event_id' column.
-    particles_batch: DataFrame containing the particle data for a batch of events, must have 'event_id' column.
-    bins: DataFrame containing the bin indices for each hit, must have 'bin0', 'bin1', 'bin2' columns.
-    hit_to_particle: Series containing the mapping from hits to particles, indexed the same as data_batch.
+    hit_to_particle: Series containing the mapping from hits to particle_id, indexed the same as data_batch. # so it is just a copy of the particle_id column of data_batch right ? hit_to_particle = data_batch["particle_id"].copy()
     hit_features: List of column names in data_batch to use as hit features.
-    particle_features: List of column names in particles_batch to use as particle features.
-    num_bins: Total number of bins used in the binning strategy.
-    cfg: Configuration object containing max_hit_input parameter.
+    max_hits_per_event: Maximum number of hits kept per event. Events with fewer hits are padded; events with more hits are truncated.
     Returns:
-    Tuple of (hits_tensor, particles_tensor, hit_to_particle_tensor) where:
-    - hits_tensor: PyTorch tensor of shape [num_events, num_bins, cfg.max_hit_input, num_hit_features]
-      containing the hit features organized by bins.
-    - particles_tensor: PyTorch tensor of shape [num_events, num_particles, num_particle_features]
-      containing the particle features.
-    - hit_to_particle_tensor: PyTorch tensor of shape [num_events, num_bins, cfg.max_hit_input, 1]
-      containing the mapping from hits to particles.
+    Tuple of (hits_tensor, hit_to_particle_tensor) where:
+    - hits_tensor: PyTorch tensor of shape [num_events, num_bins=1, max_hits_per_event, num_hit_features]
+      containing the hit features.
+    - hit_to_particle_tensor: PyTorch tensor of shape [num_events, num_bins=1, max_hits_per_event, 1].
     """
 
-    unique_events = data_batch["event_id"].unique()
-    unique_bins = bins["bin1"].unique()
-    num_events_batch = len(unique_events)
-    bin_only = bins[["bin0", "bin1", "bin2"]]
-    global_bin_mask = []
-    for bin_id in range(max(unique_bins) + 1):
-        mask = bin_only.eq(bin_id).any(axis=1)
-        global_bin_mask.append(mask)
+    unique_events = sorted(data_batch["event_id"].unique())
+    num_events = len(unique_events)
+    num_hit_features = len(hit_features)
+    num_bins = 1 
+    
+    # Initialize tensors with proper shapes [num_events, num_bins=1, max_hits_per_event, features]
+    hits_tensor = torch.zeros(
+        (num_events, num_bins, max_hits_per_event, num_hit_features),
+        dtype=torch.float32,
+    )
+    
+    hit_to_particle_tensor = torch.full( # torch.zeros() is not used because 0 is a valid_particle_id
+        (num_events, num_bins, max_hits_per_event, 1),
+        fill_value=-2, # padding convention 
+    )
 
-    # Determine max sizes for padding
-    max_particles_per_event = particles_batch.groupby("event_id").size().max()
-
-    # Initialize tensors with proper shapes [num_events, num_bins, cfg.max_hit_input, features]
-    hits_tensor = torch.zeros((num_events_batch, num_bins, max_hits_per_bin, len(hit_features)), dtype=torch.float32)
-    particles_tensor = torch.zeros((num_events_batch, max_particles_per_event, len(particle_features)), dtype=torch.float32)
-    hit_to_particle_tensor = torch.zeros((num_events_batch, num_bins, max_hits_per_bin, 1), dtype=torch.int32)
-
-    # Fill tensors event by event and bin by bin
-    for event_idx, event_id in enumerate(sorted(unique_events)):
-        event_mask = data_batch["event_id"] == event_id
-
-        # Fill particles tensor
-        event_particles = particles_batch[particles_batch["event_id"] == event_id]
-        num_event_particles = len(event_particles)
-
-        if num_event_particles > 0:
-            particles_tensor[event_idx, :num_event_particles, :] = torch.tensor(
-                event_particles[particle_features].values, dtype=torch.float32
+    # Fill tensors event by event
+    for event_idx, event_id in enumerate(unique_events):
+        event_hits = data_batch[data_batch["event_id"] == event_id]
+        
+        num_event_hits = len(event_hits)
+        n_keep = min(num_event_hits, max_hits_per_event)# number of rows to keep
+        
+        if n_keep > 0:
+            # Fill hits_tensor with hit_features
+            hits_tensor[event_idx, 0, :n_keep, :] = torch.tensor(
+                event_hits[hit_features].iloc[:n_keep].values, # .values convert from dataframe(has index column, column names) to numpy array (numeric array), shape of final product is [n_keep, number_of_features]
+                dtype=torch.float32,
+            )
+            
+            event_hit_to_particle = hit_to_particle.loc[event_hits.index].iloc[:n_keep]
+            hit_to_particle_tensor[event_idx, 0, :n_keep, 0] = torch.tensor(
+                event_hit_to_particle.values,
+                dtype=torch.int32,
             )
 
-        # Fill bin-organized hit tensors
-        for bin_id in range(max(unique_bins) + 1):
-            # Get all hits in this bin for this event
-            bin_mask = global_bin_mask[bin_id] & event_mask
-            bin_hits = data_batch[bin_mask]
-            num_bin_hits = len(bin_hits)
-
-            if num_bin_hits > 0:
-                # Fill hits tensor
-                hits_tensor[event_idx, bin_id, :num_bin_hits, :] = torch.tensor(
-                    bin_hits[hit_features].values, dtype=torch.float32
-                )
-
-                # Fill hit_to_particle tensor
-                event_hit_to_particle = hit_to_particle.loc[bin_hits.index]
-                hit_to_particle_tensor[event_idx, bin_id, :num_bin_hits, 0] = torch.tensor(
-                    event_hit_to_particle.values, dtype=torch.int32
-                )
-
-    return hits_tensor, particles_tensor, hit_to_particle_tensor
+    return hits_tensor, hit_to_particle_tensor 
 
 
 def _add_padding(
     data_batch: pd.DataFrame,
-    bins: pd.DataFrame,
     cfg: PreprocessingConfig,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Add padding hits to the data batch and corresponding bins to ensure each event has a consistent
-    number of hits per bin.
-
+    Pad or truncate hits event-by-event so that each event has cfg.max_hit_input rows.
+    
+    Conventions:
+    - particle_id >=0 : real hit belonging to a real particle
+    - particle_id == -1 : orphan hit
+    - particle_id == -2 : padding hit
+    
     Args:
         data_batch: DataFrame containing the hit data for a batch of events,
-            must have 'event_id' and 'is_padding' columns.
-        bins: DataFrame containing the bin indices for each hit, must have 'bin0', 'bin1', 'bin2' columns.
-        cfg: Configuration object containing parameters for max_hit_input.
+            must have 'event_id'.
+        cfg: Configuration object containing max_hit_input.
     Returns:
-        Tuple of (data_batch with padding hits added, bins with corresponding padding bins added)
+        A DataFrame where each event has exactly cfg.max_hit_input rows.
     """
     # Prepare the padding for each event
     print("    Preparing padding for events...")
+    
+    max_hits = cfg.max_hit_input # p95 is ~5000 for the data, p90: 4373
+    data_batch = data_batch.copy()
+    
     data_batch["is_padding"] = False
-
-    # Get unique bins and events
-    unique_bins = bins["bin1"].unique()
-    unique_events = data_batch["event_id"].unique()
-    bin_only = bins[["bin0", "bin1", "bin2"]]
-    global_bin_mask = []
-    for bin_id in range(max(unique_bins) + 1):
-        mask = bin_only.eq(bin_id).any(axis=1)
-        global_bin_mask.append(mask)
-
-    padding_data_rows = []
-    padding_bin_rows = []
-
+    
+    padded_events = [] # Stores one dataframe per event
+    num_padding_rows_added = 0 # counts how many padding rows we add in total
+    num_real_hits_truncated = 0
+    
+    unique_events = sorted(data_batch["event_id"].unique())
+    
     for event_id in unique_events:
-        event_mask = data_batch["event_id"] == event_id
+        event_hits = data_batch[data_batch["event_id"] == event_id].copy() # all hits from one event
+        num_hits = len(event_hits)
+    
+        # Remove excess hits
+        if num_hits > max_hits:
+            num_real_hits_truncated += num_hits - max_hits
+            event_hits = event_hits.iloc[:max_hits].copy()
+    
+        # Add padding if there are fewer than max_hits
+        elif num_hits < max_hits:
+            num_padding = max_hits - num_hits
+            num_padding_rows_added += num_padding
+            
+            padding_rows = []
+            for _ in range(num_padding):
+                padding_row = {}
+                
+                for col in data_batch.columns:
+                    if col == "event_id":
+                        padding_row[col] = event_id
+                    elif col == "particle_id":
+                        padding_row[col] = -2 # by convention
+                    elif col == "is_padding":
+                        padding_row[col] = True
+                    else:
+                        padding_row[col] = 0
+                        
+                padding_rows.append(padding_row)
+                
+            padding_df = pd.DataFrame(padding_rows, columns=data_batch.columns)
+            event_hits = pd.concat([event_hits, padding_df], ignore_index=True) 
+    
+        padded_events.append(event_hits) # at that point event_hits is a df representing one event, with exactly max_hits rows
 
-        for bin_id in unique_bins:
-            # Get all hits in this bin for this event (check all three bin columns)
-            bin_mask = global_bin_mask[bin_id] & event_mask
-            hits_in_bin_ = data_batch[bin_mask]
-            num_hits = len(hits_in_bin_)
-            # Remove excess hits if there are more than max_hit_input
-            if num_hits > cfg.max_hit_input:
-                # Too many hits - prioritize removing hits where bin1 != bin_id
-                bins_in_bin = bins.loc[hits_in_bin_.index]
-                primary_mask = bins_in_bin["bin1"] == bin_id
-                duplicate_indices = hits_in_bin_.index[~primary_mask].tolist()
+    out = pd.concat(padded_events, ignore_index=True)
+    
+    print(f"    Added {num_padding_rows_added} padding hits")
+    print(f"    Truncated {num_real_hits_truncated} real hits")
 
-                hits_to_remove_count = num_hits - cfg.max_hit_input
-
-                # Remove from duplicates first (from the start)
-                if len(duplicate_indices) >= hits_to_remove_count:
-                    # Enough duplicates to remove
-                    indices_to_modify = duplicate_indices[:hits_to_remove_count]
-                    bins_subset = bins.loc[indices_to_modify]
-
-                    # Replace bin0 with bin1 where bin0 == bin_id
-                    bins.loc[indices_to_modify, "bin0"] = np.where(
-                        bins_subset["bin0"] == bin_id, bins_subset["bin1"], bins_subset["bin0"]
-                    )
-
-                    # Replace bin2 with bin1 where bin2 == bin_id
-                    bins.loc[indices_to_modify, "bin2"] = np.where(
-                        bins_subset["bin2"] == bin_id, bins_subset["bin1"], bins_subset["bin2"]
-                    )
-                else:
-                    raise ValueError(
-                        f"Not enough hits to remove for Event {event_id}, Bin {bin_id}. "
-                        f"Consider adjusting max_hit_input or binning strategy."
-                    )
-
-            # Add padding if there are fewer than max_hit_input
-            elif num_hits < cfg.max_hit_input and num_hits > 0:
-                num_padding = cfg.max_hit_input - num_hits
-                # Create padding entries with same structure as data
-                for _ in range(num_padding):
-                    # Create padding data row
-                    padding_data_row = {}
-                    padding_data_row["event_id"] = event_id
-                    padding_data_row["particle_id"] = -1  # Padding has no particle
-                    padding_data_row["is_padding"] = True  # Mark as padding
-
-                    # Set other columns to default values (0 or NaN)
-                    for col in data_batch.columns:
-                        if col not in padding_data_row:
-                            padding_data_row[col] = 0
-
-                    # Create corresponding padding bin row
-                    padding_bin_row = {"bin0": bin_id, "bin1": bin_id, "bin2": bin_id}
-
-                    padding_data_rows.append(padding_data_row)
-                    padding_bin_rows.append(padding_bin_row)
-
-    # Add padding rows to both data_batch and bins
-    if padding_data_rows:
-        padding_data_df = pd.DataFrame(padding_data_rows)
-        padding_bins_df = pd.DataFrame(padding_bin_rows)
-        data_batch = pd.concat([data_batch, padding_data_df], ignore_index=True)
-        bins = pd.concat([bins, padding_bins_df], ignore_index=True)
-        print(f"    Added {len(padding_data_rows)} padding hits")
-
-    return data_batch, bins
+    return out
 
 
 def _create_padding_mask(
     data_batch: pd.DataFrame,
-    bins: pd.DataFrame,
-    num_bins: int,
     cfg: PreprocessingConfig,
 ) -> Tuple[pd.DataFrame, torch.Tensor]:
     """
@@ -385,52 +374,34 @@ def _create_padding_mask(
     Args:
         data_batch: DataFrame containing the hit data for a batch of events,
             must have 'event_id' and 'is_padding' columns.
-        bins: DataFrame containing the bin indices for each hit,
-            must have 'bin0', 'bin1', 'bin2' columns.
-        num_bins: Total number of bins used in the binning strategy.
-        cfg: Configuration object containing parameters for max_hit_input.
+        cfg: Configuration object containing max_hit_input.
     Returns:
-        Padding mask tensor of shape [num_events, num_bins, max_hit_input]
+        Tuple of:
+        - data_batch with the 'id_padding' column removed
+        - Padding mask tensor of shape [num_events, num_bins=1, cfg.max_hit_input]
         where True indicates padding positions.
     """
-    unique_bins = bins["bin1"].unique()
-    unique_events = data_batch["event_id"].unique()
-    bin_only = bins[["bin0", "bin1", "bin2"]]
-    global_bin_mask = []
-    for bin_id in range(max(unique_bins) + 1):
-        mask = bin_only.eq(bin_id).any(axis=1)
-        global_bin_mask.append(mask)
-
-    # Create padding mask tensor [num_events, num_bins, max_hit_input]
+    
+    # Create padding mask tensor [num_events, num_bins=1, max_hit_input]
     print("    Creating padding mask...")
-    num_events_batch = len(unique_events)
+    
+    unique_events = sorted(data_batch["event_id"].unique())
+    num_events = len(unique_events)
+    max_hits = cfg.max_hit_input
+    num_bins = 1 
 
-    # Initialize padding mask as all False (PyTorch tensor)
-    padding_mask = torch.zeros((num_events_batch, num_bins, cfg.max_hit_input), dtype=torch.bool)
+    # Initialize padding mask as all False = real hit
+    padding_mask = torch.zeros((num_events, num_bins, max_hits), dtype=torch.bool)
 
-    # Build a mapping from event_id to event index
-    event_to_idx = {event_id: idx for idx, event_id in enumerate(sorted(unique_events))}
-
-    # For each event and bin, count real hits and mask padding positions
-    for event_id in unique_events:
-        event_idx = event_to_idx[event_id]
-        event_mask = data_batch["event_id"] == event_id
-
-        for bin_id in unique_bins:
-            # Count real hits (non-padding) in this bin for this event
-            bin_mask = global_bin_mask[bin_id] & event_mask
-            num_real_hits = (~data_batch[bin_mask]["is_padding"]).sum()
-
-            if num_real_hits == 0:
-                # Empty bin - mask everything
-                padding_mask[event_idx, bin_id, :] = True
-            elif num_real_hits < cfg.max_hit_input:
-                # Create mask: True if position >= num_real_hits
-                padding_mask[event_idx, bin_id, num_real_hits:] = True
-
-    data_batch = data_batch.drop(columns=["is_padding"])
-
-    return data_batch, padding_mask
+    for event_idx, event_id in enumerate(unique_events):
+        event_hits = data_batch[data_batch["event_id"] == event_id]
+        event_is_padding = event_hits["is_padding"].to_numpy()
+        
+        padding_mask[event_idx, 0, :] = torch.tensor(event_is_padding, dtype=torch.bool)
+    
+    data_batch = data_batch.drop(columns=["is_padding"]).copy()
+    
+    return  data_batch, padding_mask
 
 
 def _orphan_hit_removal(data_batch: pd.DataFrame, fraction_to_drop: float, random_state: int = 1993) -> pd.DataFrame:
@@ -457,37 +428,6 @@ def _orphan_hit_removal(data_batch: pd.DataFrame, fraction_to_drop: float, rando
         data_batch = data_batch.drop(index=drop_indices).reset_index(drop=True)
 
     return data_batch
-
-
-def _bin_data(data_batch: pd.DataFrame, cfg: PreprocessingConfig) -> Tuple[pd.DataFrame, int]:
-    """
-    Bin the data according to the specified binning strategy in the config.
-
-    Args:
-        data_batch: DataFrame containing the hit data for a batch of events, must have a 'phi' column.
-        cfg: Configuration object containing binning parameters.
-
-    Returns:
-        Tuple of (bins DataFrame with bin indices, number of bins)
-    """
-    phi_range = (-math.pi, math.pi)  # Assuming phi is in the range [-pi, pi]
-
-    if cfg.binning_strategy == "no_bin" or cfg.bin_width > 2 * math.pi:
-        bins, num_bins = no_bin(data_batch[["phi"]])
-    elif cfg.binning_strategy == "global":
-        bins, num_bins = global_bin(data_batch[["phi"]], cfg.bin_width, phi_range)
-    elif cfg.binning_strategy == "neighbor":
-        bins, num_bins = neighbor_bin(data_batch[["phi"]], cfg.bin_width, phi_range)
-    elif cfg.binning_strategy == "margin":
-        bins, num_bins = margin_bin(data_batch[["phi"]], cfg.bin_width, cfg.binning_margin, phi_range)
-    else:
-        raise ValueError(f"Unknown binning strategy: {cfg.binning_strategy}")
-
-    # Reset indices to align bins with data_batch
-    data_batch = data_batch.reset_index(drop=True)
-    bins = bins.reset_index(drop=True)
-
-    return bins, num_bins
 
 
 def _save_tensor_data(
@@ -539,90 +479,69 @@ def _process_single_batch(args: Tuple) -> Tuple[str, Tuple[int, int], int, int]:
     Process a single batch of events and save the resulting tensors to disk.
 
     Args:
-        args: Tuple of (data_batch, particles_batch, cfg, hit_features, particle_features,
-                        file_id, barcode, start_event, end_event)
-
+        args: Tuple of (data_batch, cfg, hit_features, file_id, barcode, start_event, end_event)
     Returns:
-        Tuple of (file_path, (start_event, end_event), num_events_processed, nb_bins_max)
+        Tuple of (file_path, (start_event, end_event), num_events_processed, nb_bins_max = 1)
     """
-    data_batch, particles_batch, cfg, hit_features, particle_features, file_id, barcode, start_event, end_event = args
+    
+    data_batch, cfg, hit_features, file_id, barcode, start_event, end_event = args
 
     print(f"  Processing events {start_event} to {end_event - 1}")
 
+    nb_bins_max = 1 
+    
     # Optionally perform orphan hit removal
     data_batch = _orphan_hit_removal(data_batch, cfg.orphan_hit_fraction)
 
-    # Apply geometric hit range cuts [R_max, Z_max]
-    data_batch = _hit_selection(data_batch, cfg)
+    # Pad or truncate each event to cfg.max_hit_input rows 
+    data_batch = _add_padding(data_batch, cfg)
+    
+    # Build padding mask from the temporary 'is_padding' column
+    data_batch, padding_mask = _create_padding_mask(data_batch, cfg)
 
-    # Perform binning and tensor preparation
-    bins, nb_bins_max = _bin_data(data_batch, cfg)
-
-    # Add padding hits and corresponding bins to ensure consistent input size
-    data_batch, bins = _add_padding(data_batch, bins, cfg)
-
-    # Create the padding mask tensor for this batch
-    data_batch, padding_mask = _create_padding_mask(data_batch, bins, nb_bins_max, cfg)
-
-    # Create the hit_to_particle mapping for this batch (after all reordering)
+    # Create hit-to-particle mapping 
     hit_to_particle = data_batch["particle_id"].copy()
-
-    # Apply specific particle selection as defined in the config
-    data_batch, particles_batch, bins, hit_to_particle = _particle_selection(
-        data_batch, particles_batch, bins, hit_to_particle, cfg
-    )
-
-    # Create the good pairs tensor for this batch
-    good_pairs = _build_good_pairs_tensors(data_batch, bins, hit_to_particle, nb_bins_max, pv_weight=cfg.pv_pair_weight)
-
-    data_batch = data_batch.drop(columns=["particle_id_pv"], errors="ignore")
-
+    
     # Convert to tensors
-    hits_tensor, particles_tensor, hit_to_particle_tensor = _to_tensor(
-        data_batch,
-        particles_batch,
-        bins,
-        hit_to_particle,
-        hit_features,
-        particle_features,
-        nb_bins_max,
-        cfg.max_hit_input,
+    hits_tensor, hit_to_particle_tensor = _to_tensor(
+        data_batch=data_batch,
+        hit_to_particle=hit_to_particle,
+        hit_features=hit_features,
+        max_hits_per_event=cfg.max_hit_input,
     )
-
+    
     full_path = f"{cfg.input_tensor_path}/{cfg.dataset_name}_{barcode}"
     path = f"/{cfg.dataset_name}_{barcode}"
-
-    # Create the output directory if it doesn't exist
+    
+    # Create output directory if it doesn't exist
     os.makedirs(full_path, exist_ok=True)
-
-    # Get the unique event IDs for this chunk
+    
+    # Get the unique event IDs for this batch
     batch_events = sorted(data_batch["event_id"].unique())
-
+    
     # Create a single dictionary with all data
     file_data = {
         "hits_tensor": hits_tensor,
-        "particles_tensor": particles_tensor,
-        "good_pairs": good_pairs,
         "hit_to_particle_tensor": hit_to_particle_tensor,
         "padding_mask": padding_mask,
         "start_event": start_event,
         "end_event": end_event,
-        "nb_bins": nb_bins_max,
+        "nb_bins": 1,
         "batch_events": batch_events,
     }
-
-    # Save tensor file in the specified format
+    
+    # Save tensor file
     file_base = f"{full_path}/tensor_data_{file_id}_{barcode}"
     _save_tensor_data(file_data, file_base, cfg.tensor_format)
-
+    
     # Determine file extension based on tensor format
     file_ext = ".pt" if cfg.tensor_format == "pt" else ".h5"
-
-    print(f"  Saved tensor data for events {start_event} to {end_event - 1} ({cfg.tensor_format} format)")
-
+    
+    print(f" Saved tensor data for events {start_event} to {end_event - 1}({cfg.tensor_format}format)")
+    
     file_path = f"{path}/tensor_data_{file_id}_{barcode}{file_ext}"
     return file_path, (start_event, end_event), end_event - start_event, nb_bins_max
-
+     
 
 def compute_barcode(cfg: PreprocessingConfig) -> str:
     """
@@ -631,12 +550,13 @@ def compute_barcode(cfg: PreprocessingConfig) -> str:
     Args:
         cfg: Configuration object containing parameters that affect the dataset preparation.
     Returns:
-        A string barcode that encodes key configuration parameters such as binning strategy,
-        bin width, max hits, and orphan hit fraction.
+        A string barcode that encodes key configuration parameters : max hits, and orphan hit fraction.
     """
-    barcode = f"BS{cfg.binning_strategy}_BW{cfg.bin_width}_MH{cfg.max_hit_input}_PW{int(cfg.pv_pair_weight)}"
+    barcode = f"MH{cfg.max_hit_input}"
+    
     if cfg.orphan_hit_fraction > 0:
         barcode += f"_OF{int(cfg.orphan_hit_fraction * 100)}"
+        
     return barcode
 
 
@@ -644,26 +564,23 @@ def prepare_tensor(
     cfg: PreprocessingConfig,
 ) -> Dict:
     """
-    Read CSV or HDF5 files produced by Read_ACTS_Csv.py or Read_ACTS_Root.py and prepare them for training
-    by converting to PyTorch tensors.
+    Read DUNE hit files and prepare them for training by converting to PyTorch tensors.
 
-    This function performs the complete data preprocessing pipeline including:
-    - Loading hit and particle data from CSV or HDF5 files
-    - Optionally removing a fraction of orphan hits (hits with no associated particle)
-    - Binning hits according to the specified strategy
-    - Adding padding to ensure consistent tensor sizes per bin
-    - Creating padding masks for attention mechanisms
-    - Filtering particles based on eta range and removing associated hits
-    - Converting all data to PyTorch tensors
+    This function performs the complete data preprocessing pipeline:
+    - load hit data from CSV or HDF5 files
+    - optionally remove a fraction of orphan hits (hits with no associated particle) via _process_single_batch() function
+    - pad or truncate each event to cfg.max_hit_input hits
+    - creating a padding mask for attention mechanisms
+    - save hit_to_particle_tensor so positive pairs can be sampled during training 
+    - convert all data to PyTorch tensors
+    - save one tensor file per batch of events
 
     For each batch of events, a single data file is saved to disk in either PyTorch (.pt) or
     compressed HDF5 (.h5) format containing:
-    - `hits_tensor`: Hit data with shape [num_events, num_bins, num_hits, num_hit_features]
-    - `particles_tensor`: Particle data with shape [num_events, num_particles, num_particle_features]
-    - `good_pairs`: Good pairs tensor for training
-    - `hit_to_particle_tensor`: Hit-to-particle mapping with shape [num_events, num_bins, num_hits, 1]
-    - `padding_mask`: Padding mask with shape [num_events, num_bins, max_hit_input]
-    - Metadata: start_event, end_event, nb_bins, batch_events
+    - `hits_tensor`: Hit data with shape [num_events, num_bins=1, max_hit_input, num_hit_features]
+    - `hit_to_particle_tensor`: Hit-to-particle mapping with shape [num_events, num_bins=1, max_hit_input, 1]
+    - `padding_mask`: Padding mask with shape [num_events, num_bins=1, max_hit_input]
+    - Metadata: start_event, end_event, nb_bins=1, batch_events
 
     A metadata file is also created containing information about the dataset structure and file paths.
     The output format (PyTorch or HDF5) is controlled by cfg.tensor_format.
@@ -678,70 +595,59 @@ def prepare_tensor(
             - binning_strategy: Binning strategy to use ('global', 'neighbor', 'margin', 'no_bin')
             - bin_width: Width of bins for binning
             - max_hit_input: Maximum number of hits per bin
-            - eta_range: Tuple specifying the eta range for particle selection
             - hit_features: List of column names to use as hit features
-            - particle_features: List of column names to use as particle features
             - tensor_format: Output tensor file format ('pt' for PyTorch or 'h5' for compressed HDF5)
 
     Returns:
         Dictionary containing metadata about the processed dataset including:
         - total_events: Total number of events processed
-        - events_per_file: Number of events per output file
-        - nb_bins: Maximum number of bins used
+        - events_per_file: Number of events per output file 
+        - nb_bins: Maximum number of bins used, here 1 
         - orphan_hit_fraction: Fraction of orphan hits removed
-        - eta_range: Eta range used for particle selection
         - file_paths: List of paths to generated tensor files
         - file_event_ranges: List of (start, end) event ranges for each file
     """
 
     # Use feature lists from config
     hit_features = cfg.hit_features
-    particle_features = cfg.particle_features
-    needed_columns = list(set(["event_id", "particle_id", "particle_id_pv", "phi"] + hit_features))
-    # Metadata variable to be used to describe the dataset and keep track of file paths
-    # and event ranges for each tensor file
+    needed_columns = list(set(["event_id", "particle_id"] + hit_features)) 
+    
     total_events = 0
-    nb_bins_max = 0
+    nb_bins_max = 1
     file_paths: List[str] = []
     file_event_ranges: List[Tuple[int, int]] = []
     orphan_hit_fraction = cfg.orphan_hit_fraction
-    events_per_file = cfg.events_per_file
+    events_per_file = cfg.events_per_file 
     barcode = compute_barcode(cfg)
 
     # Get file paths based on format
     input_path = cfg.input_path
     input_format = cfg.input_format
     data_files = []
+    
     # Collect all data files and prepare for loop
     if input_format == "h5":
         # Get all HDF5 files
-        data_files = sorted(glob.glob(f"{input_path}/processed_data*.h5"))  # type: ignore[arg-type]
+        data_files = sorted(glob.glob(f"{input_path}/processed_data*.h5"))
         print(f"Found {len(data_files)} HDF5 file(s)")
+        if len(data_files) == 0:
+            raise FileNotFoundError(f"No processed_data*.h5 files found in {input_path}")
 
     elif input_format == "csv":
-        # Look for either space_points or hits CSV files
-        space_points_files = sorted(glob.glob(f"{input_path}/space_points_small*.csv"))
-        hits_files = sorted(glob.glob(f"{input_path}/hits_small*.csv"))
-        particles_files = sorted(glob.glob(f"{input_path}/particles_small*.csv"))
-        # Adapt the logic to handle both hits ans space points and pair with particles files
-        if space_points_files:
-            data_files = list(zip(space_points_files, particles_files))  # type: ignore[arg-type]
-            data_type = "space_points"
-            print(f"Found {len(space_points_files)} space_points CSV file(s)")
-        elif hits_files:
-            data_files = list(zip(hits_files, particles_files))  # type: ignore[arg-type]
-            data_type = "hits"
-            print(f"Found {len(hits_files)} hits CSV file(s)")
-        else:
-            raise FileNotFoundError(f"No space_points_small*.csv or hits_small*.csv files found in {input_path}")
+        data_files = sorted(glob.glob(f"{input_path}/hits_small*.csv"))
+        print(f"Found {len(data_files)} hits CSV file(s)")
+        if len(data_files) == 0:
+            raise FileNotFoundError(f"No hits_small*.csv files found in {input_path}")
+        
     else:
-        raise ValueError(f"Unsupported input format: {input_format}. Use 'h5' or 'csv'")
-
+        raise ValueError(f"Unsupported input format: {input_format}. Use 'csv' or 'h5")
+    
     file_id = 0
-    tot_event = 0
+    tot_event = 0 
+    
     # Processing each file
     for file_idx, data_file in enumerate(data_files):
-        if cfg.max_events > 0 and tot_event > cfg.max_events:
+        if cfg.max_events > 0 and tot_event >= cfg.max_events:
             print(f"Reached max_events limit of {cfg.max_events}. Stopping further processing.")
             break
 
@@ -749,106 +655,103 @@ def prepare_tensor(
 
         if input_format == "h5":
             # Read data from HDF5 file
-            # The file can contain either 'space_points' or 'hits' depending on how it was created
             with pd.HDFStore(data_file, mode="r") as store:
                 # Check which key exists in the HDF5 file
                 keys = [key.lstrip("/") for key in store.keys()]
 
-                if "space_points" in keys:
-                    data = store.select("space_points", columns=needed_columns)
-                    print("  Loaded space_points data")
-                elif "hits" in keys:
-                    data = store.select("hits", columns=needed_columns)
-                    print("  Loaded hits data")
-                else:
-                    raise KeyError(f"Neither 'space_points' nor 'hits' found in {data_file}. Available keys: {store.keys()}")
-
-                # Load particles data
-                particles = store.get("particles")
+                if "hits" not in keys:
+                    raise KeyError(f"hits not found in {data_file}. Available keys:{store.keys()}")
+                
+                data = store.select("hits", columns=needed_columns)
+                print(f" Loaded hits data from {data_file}")
 
         elif input_format == "csv":
             # Read data from CSV files
-            data_csv_file, particles_csv_file = data_file  # type: ignore[misc]
-            data = pd.read_csv(data_csv_file)  # type: ignore[has-type]
-            particles = pd.read_csv(particles_csv_file)  # type: ignore[has-type]
-            print(f"  Loaded {data_type} data from {data_csv_file}")  # type: ignore[has-type]
-
-        # Check if the number of events in data is divisible by the events_per_file
-        num_events = len(data["event_id"].unique())
+            data = pd.read_csv(data_file)
+            data = data[needed_columns].copy()
+            print(f" Loaded hits data from {data_file}")
+            
+        event_ids_all = sorted(data["event_id"].unique())  
+        num_events = len(event_ids_all)
         tot_event += num_events
-        # Apply max_events limit if specified
+        
         if cfg.max_events > 0 and tot_event > cfg.max_events:
-            print(f"  Limiting to {cfg.max_events} events (out of {num_events} available)")
-            num_events = cfg.max_events + num_events - tot_event
-            # Filter data to only include the first max_events events
-            event_ids = sorted(data["event_id"].unique())[:num_events]
-            data = data[data["event_id"].isin(event_ids)].reset_index(drop=True)
-            particles = particles[particles["event_id"].isin(event_ids)].reset_index(drop=True)
-
-        if num_events % events_per_file != 0:
-            print(
-                f"WARNING: Number of events in {data_file} ({num_events}) "
-                f"is not divisible by events_per_file ({events_per_file})"
+            allowed_events = cfg.max_events + num_events - tot_event
+            print((f" Limiting to {allowed_events} event(s) from this file"))
+            event_ids_all = event_ids_all[:allowed_events]
+            data = data[data["event_id"].isin(event_ids_all)].reset_index(drop=True)
+            num_events = len(event_ids_all)
+            
+        if num_events == 0: # safety guard
+            continue
+        
+        if num_events % events_per_file != 0: # each file divided into chunks, events_per_file = number of events per chunk
+            print(f"Warning: Number of events in {data_file}({num_events})"
+                  f"is not divisible by events_per_file ({events_per_file})"
             )
-
+        
         # Build arguments for each batch so they can be processed in parallel
         batch_args = []
         local_file_id = file_id
-        for start_event in range(0, num_events, events_per_file):
-            end_event = min(start_event + events_per_file, num_events)
+        
+        for batch_start_idx in range(0, num_events, events_per_file):
+            batch_end_idx = min(batch_start_idx + events_per_file, num_events)
+            
+            batch_event_ids = event_ids_all[batch_start_idx:batch_end_idx]
+            
+            data_batch = data[data["event_id"].isin(batch_event_ids)].reset_index(drop=True)
 
-            # Select data for this batch of events
-            data_batch = data[(data["event_id"] >= start_event) & (data["event_id"] < end_event)].reset_index(drop=True)
-            particles_batch = particles[(particles["event_id"] >= start_event) & (particles["event_id"] < end_event)].reset_index(
-                drop=True
-            )
-
+            start_event = int(batch_event_ids[0])
+            end_event = int(batch_event_ids[-1])+1
+            
             batch_args.append(
                 (
                     data_batch,
-                    particles_batch,
                     cfg,
                     hit_features,
-                    particle_features,
                     local_file_id,
                     barcode,
                     start_event,
                     end_event,
+                    
                 )
             )
             local_file_id += 1
-
-        # Process batches – in parallel when num_workers > 1, sequentially otherwise
+            
+        # Process batches
         num_workers = min(cfg.num_workers, len(batch_args))
         if num_workers > 1:
-            print(f"  Spawning {num_workers} worker processes for {len(batch_args)} batch(es)")
+            print(f" Spawning {num_workers} worker processes for {len(batch_args)} batch(es)")
             with multiprocessing.Pool(processes=num_workers) as pool:
                 results = pool.map(_process_single_batch, batch_args)
         else:
             results = [_process_single_batch(args) for args in batch_args]
-
-        # Collect results (results are already ordered by start_event)
+        
+        # Collect results 
         for file_path, event_range, n_events, nb_bins in results:
             file_paths.append(file_path)
             file_event_ranges.append(event_range)
             total_events += n_events
-            nb_bins_max = max(nb_bins_max, nb_bins)
-
+            nb_bins_max = max(nb_bins_max, nb_bins)# needed ? 
+            
         file_id = local_file_id
-
-    # Create the metadata file and save it to the current directory
+        
+        # Save metadata
     metadata = {
         "total_events": total_events,
         "events_per_file": events_per_file,
         "nb_bins": nb_bins_max,
         "orphan_hit_fraction": orphan_hit_fraction,
-        "eta_range": cfg.eta_range,
+        "max_hit_input": cfg.max_hit_input,
+        "hit_features": hit_features,
         "tensor_format": cfg.tensor_format,
         "file_paths": file_paths,
         "file_event_ranges": file_event_ranges,
     }
-
+    
+    os.makedirs(cfg.input_tensor_path, exist_ok=True)
     torch.save(metadata, f"{cfg.input_tensor_path}/metadata_{cfg.dataset_name}_{barcode}.pt")
+    
     return metadata
 
 

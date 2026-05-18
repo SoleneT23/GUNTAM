@@ -5,74 +5,86 @@ from typing import List, Tuple
 
 def topk_seed_reconstruction(
     attention_map: torch.Tensor,
-    hit_score: torch.Tensor,
-    threshold: float = 0.8,
+    hit_to_particle: torch.Tensor,
     max_selection: int = 4,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+) -> List[np.ndarray]:
     """
-    K-nearest seeding with threshold: for each valid hit, create a seed consisting of the hit
-    itself plus up to "max_selection" other hits with the highest attention values from that hit,
-    keeping only those neighbors whose hit score is >= threshold.
-
+    For each non-orphan & non-padding hit, create one seed made of:
+    - the seed itself,
+    - up to max_selection neighbors (non orphan and non padding hit neighbors) with highest attention
+    
     Args:
-        attention_map: 2D tensor [N, N] with attention weights
-        hit_score: tensor [N, 1] with per-hit scores
-        threshold: Minimum hit score required to keep a neighbor (default: 0.8)
-        max_selection: Maximum number of neighbors to select per hit (default: 4)
-
+        attention_map:
+            Tensor [N,N], attention weights between hits
+            
+        hit_to_particle:
+            Tensor [N] or [N,1].
+            Values:
+                particle_id >=0 : real particle hit
+                -1              : orphan hit
+                -2              : padding hit
+                
+        max_selection:
+            Maximum number of neighbors selected per seed.
+            
     Returns:
-        List of (hit_indices, avg_parameters) tuples; one seed per valid hit
+        List of numpy arrays.
+        Each array contains the original hit indices of one seed.
     """
     device = attention_map.device
-    seeds: List[Tuple[np.ndarray, np.ndarray]] = []
-
+    seeds: List[np.ndarray] = []
+    
     num_hits = attention_map.size(0)
     if num_hits == 0:
         return seeds
+    
+    hit_to_particle = hit_to_particle.to(device).reshape(-1)
+    
+    valid_mask = hit_to_particle >= 0
 
-    # Use all hits (remove selection on scores)
-    allowed_indices = torch.arange(num_hits, device=device)
-    allowed_count = num_hits
-    k = min(max_selection, max(0, allowed_count - 1))
-
-    # Restrict attention matrix to allowed columns
-    att_allowed = attention_map[:, allowed_indices].clone()
-
-    # Forbid self-attention (set diagonal to -inf)
-    if allowed_count == num_hits:
-        att_allowed.fill_diagonal_(float("-inf"))
-    else:
-        arange = torch.arange(num_hits, device=device)
-        common = torch.where((arange[:, None] == allowed_indices[None, :]))
-        if common[0].numel() > 0:
-            att_allowed[common] = float("-inf")
-
+    valid_indices = torch.where(valid_mask)[0]
+    valid_count = valid_indices.numel()
+    
+    if valid_count == 0:
+        return seeds
+        
+    k = min(max_selection, max(0, valid_count - 1))
+    
+    att_valid = attention_map[valid_indices][:, valid_indices].clone()
+    
+    att_valid.fill_diagonal_(float("-inf"))
+    
     if k > 0:
-        # Get top-k attention scores and indices per row
-        _, topk_idx = torch.topk(att_allowed, k, dim=1, largest=True, sorted=True)  # [N, k]
-        topk_global = allowed_indices[topk_idx]  # [N, k]
-    else:
-        topk_global = torch.empty((num_hits, 0), dtype=torch.long, device=device)
-
-    # Build clusters per valid hit, applying attention threshold filter
-    for i in range(num_hits):
-        neighbor_indices = topk_global[i]  # [k]
-
-        # Keep only neighbors whose hit score is above threshold
-        keep_mask = hit_score[neighbor_indices].squeeze(-1) >= threshold
-        kept_neighbors = neighbor_indices[keep_mask]
-
-        # Cluster = hit itself + kept neighbors (could be only the hit if none kept)
-        cluster_idx = torch.cat([torch.tensor([i], device=device, dtype=torch.long), kept_neighbors], dim=0)
-
-        # No parameter reconstruction: seed params set to zero
-        seed_params = np.zeros(5, dtype=np.float32)
-
-        # Append as numpy arrays
-        seeds.append((cluster_idx.cpu().numpy(), seed_params))
-
+        _, topk_local_idx = torch.topk(
+            att_valid,
+            k=k,
+            dim=1,
+            largest=True,
+            sorted=True 
+        )
+        topk_global_idx = valid_indices[topk_local_idx]
+    else: # if valid_count = 1 
+        topk_global_idx = torch.empty(
+            (valid_count, 0),
+            dtype=torch.long,
+            device=device,
+        )
+    
+    for local_i, global_i in enumerate(valid_indices):
+        neighbor_indices = topk_global_idx[local_i]
+        
+        seed_indices = torch.cat(
+            [
+                global_i.reshape(-1),
+                neighbor_indices,
+            ],
+            dim=0,
+        )
+        
+        seeds.append(seed_indices.cpu().numpy())
+        
     return seeds
-
+        
 
 def chained_seed_reconstruction(
     attention_map: torch.Tensor,

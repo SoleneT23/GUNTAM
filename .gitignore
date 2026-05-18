@@ -1,3 +1,16 @@
+# Files for checking 
+analyse_hits.py
+check_pairs.py 
+split_csv_file.py
+sample_positive_pairs_details.py
+run_model_details.py
+test_forward_memory.py
+main_Train_details.py
+train_model_Train.py
+
+.DS_Store
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -117,7 +117,7 @@ def top_attention_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
     pairs1: torch.Tensor,  # [N_pairs] first hit indices of each pair
     pairs2: torch.Tensor,  # [N_pairs] second hit indices of each pair
-    target: torch.Tensor,  # [N_pairs] target labels (-1 or 1)
+    target: torch.Tensor,  # [N_pairs] target labels (0 or 1)
 ) -> torch.Tensor:
     """
     Top-k attention loss using BCE-with-logits on masked entries, styled like full_attention_loss.
@@ -147,7 +147,7 @@ def top_attention_loss(
     pair_weights_pos = target[pos_mask].abs().float()
 
     # Hits involved in positives and valid window size
-    pos_hits = torch.unique(torch.cat([pairs1[pos_mask], pairs2[pos_mask]]))
+    pos_hits = torch.unique(torch.cat([pairs1[pos_mask], pairs2[pos_mask]])) # even if the attention matrix is not symmetric, the pairs of hits are, so why are we concatenating pairs1 and pairs2
     num_valid_hits = int(torch.max(pos_hits).item()) + 1
 
     # Build window + column mask focusing around positives
@@ -157,7 +157,7 @@ def top_attention_loss(
 
     inactive_cols = torch.ones(attention_map_bin.shape[0], dtype=torch.bool, device=device)
     inactive_cols[pos_hits] = False
-    full_mask[:, inactive_cols] = False
+    full_mask[:, inactive_cols] = False # if I don't have orphan hits, but only real hits and padding hits, and padding hits are added at the end of events, then num_valid_hits on full_mask is sufficient, we don't need inactive_cols no ? 
 
     # Positive logits
     pos_i = pairs1[pos_mask]
@@ -170,7 +170,7 @@ def top_attention_loss(
     neg_mask[pos_i, pos_j] = False
     neg_scores = attention_map_bin[neg_mask]
 
-    k = min(num_pos, neg_scores.numel())
+    k = min(num_pos, neg_scores.numel()) # usually there are more neg_scores than pos_scores
     top_neg_scores, _ = torch.topk(neg_scores, k=k, largest=True, sorted=False)
 
     logits = torch.cat([pos_scores, top_neg_scores], dim=0)
