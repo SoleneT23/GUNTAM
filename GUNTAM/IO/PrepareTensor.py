@@ -274,11 +274,13 @@ def _to_tensor(
         
         if n_keep > 0:
             # Fill hits_tensor with hit_features
+            hit_values = event_hits[cfg.hit_features].to_numpy()[:n_keep].copy()
+
             hits_tensor[event_idx, 0, :n_keep, :] = torch.tensor(
-                event_hits[hit_features].iloc[:n_keep].values, # .values convert from dataframe(has index column, column names) to numpy array (numeric array), shape of final product is [n_keep, number_of_features]
+                hit_values,
                 dtype=torch.float32,
             )
-            
+                        
             event_hit_to_particle = hit_to_particle.loc[event_hits.index].iloc[:n_keep]
             hit_to_particle_tensor[event_idx, 0, :n_keep, 0] = torch.tensor(
                 event_hit_to_particle.values,
