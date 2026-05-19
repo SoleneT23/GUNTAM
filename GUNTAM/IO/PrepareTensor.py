@@ -396,6 +396,7 @@ def _add_padding(
     for event_id in unique_events:
         event_hits = data_batch[data_batch["event_id"] == event_id].copy() # all hits from one event
         num_hits = len(event_hits)
+        event_seed = getattr(cfg, "random_state", 1993) + int(event_id)
     
         # Remove excess hits
         if num_hits > max_hits:
@@ -403,33 +404,39 @@ def _add_padding(
             event_hits = _balanced_truncate_event(
                 event_hits=event_hits,
                 max_hits=max_hits,
-                random_state=getattr(cfg, "random_state", 1993) + int(event_id), # different events get different seeds
+                random_state=event_seed, # different events get different seeds
             )
     
-        # Add padding if there are fewer than max_hits
-        elif num_hits < max_hits:
-            num_padding = max_hits - num_hits
-            num_padding_rows_added += num_padding
+        else:
+            event_hits = event_hits.sample(
+                frac=1,
+                random_state=event_seed,
+            ).reset_index(drop=True)
             
-            padding_rows = []
-            for _ in range(num_padding):
-                padding_row = {}
+            # Add padding if there are fewer than max_hits
+            if num_hits < max_hits:
+                num_padding = max_hits - num_hits
+                num_padding_rows_added += num_padding
                 
-                for col in data_batch.columns:
-                    if col == "event_id":
-                        padding_row[col] = event_id
-                    elif col == "particle_id":
-                        padding_row[col] = -2 # by convention
-                    elif col == "is_padding":
-                        padding_row[col] = True
-                    else:
-                        padding_row[col] = 0
-                        
-                padding_rows.append(padding_row)
-                
-            padding_df = pd.DataFrame(padding_rows, columns=data_batch.columns)
-            event_hits = pd.concat([event_hits, padding_df], ignore_index=True) 
-    
+                padding_rows = []
+                for _ in range(num_padding):
+                    padding_row = {}
+                    
+                    for col in data_batch.columns:
+                        if col == "event_id":
+                            padding_row[col] = event_id
+                        elif col == "particle_id":
+                            padding_row[col] = -2 # by convention
+                        elif col == "is_padding":
+                            padding_row[col] = True
+                        else:
+                            padding_row[col] = 0
+                            
+                    padding_rows.append(padding_row)
+                    
+                padding_df = pd.DataFrame(padding_rows, columns=data_batch.columns)
+                event_hits = pd.concat([event_hits, padding_df], ignore_index=True) 
+        
         padded_events.append(event_hits) # at that point event_hits is a df representing one event, with exactly max_hits rows
 
     out = pd.concat(padded_events, ignore_index=True)
