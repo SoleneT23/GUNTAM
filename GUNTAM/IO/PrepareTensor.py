@@ -318,7 +318,7 @@ def _balanced_truncate_event(
     selected_parts = []
     
     for pid in particle_ids:
-        hits_pid = real_hits[real_hits["particle_id" == pid]]
+        hits_pid = real_hits[real_hits["particle_id"] == pid]
         
         n_take = min(len(hits_pid), quota_per_particle)
         
