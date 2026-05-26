@@ -168,6 +168,8 @@ def top_attention_loss(
     # Negative candidates = masked entries excluding positives
     neg_mask = full_mask.clone()
     neg_mask[pos_i, pos_j] = False
+    diag = torch.arange(attention_map_bin.shape[0], device=device)
+    neg_mask[diag, diag]= False
     neg_scores = attention_map_bin[neg_mask]
 
     k = min(num_pos, neg_scores.numel()) # usually there are more neg_scores than pos_scores
