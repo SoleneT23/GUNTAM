@@ -192,11 +192,11 @@ def top_attention_loss(
     weights = torch.cat([pos_weights, neg_weights], dim=0)
     
     if return_debug:
-    debug_info = {
+        debug_info = {
         "positive_scores": positive_scores.detach(),
         "negative_scores": negative_scores.detach(),
     }
-    return loss, debug_info
+        return loss, debug_info
     
     return F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
 
