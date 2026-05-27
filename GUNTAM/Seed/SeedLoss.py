@@ -115,68 +115,120 @@ def full_attention_loss(
 
 def top_attention_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
-    pairs1: torch.Tensor,  # [N_pairs] first hit indices of each pair
-    pairs2: torch.Tensor,  # [N_pairs] second hit indices of each pair
-    target: torch.Tensor,  # [N_pairs] target labels (0 or 1)
+    pairs1: torch.Tensor,             # [N_pairs] first hit indices of each pair
+    pairs2: torch.Tensor,             # [N_pairs] second hit indices of each pair
+    target: torch.Tensor,             # [N_pairs] target labels
     return_debug=False,
 ) -> torch.Tensor:
     """
-    Top-k attention loss using BCE-with-logits on masked entries, styled like full_attention_loss.
+    Top-k attention loss using BCE-with-logits.
 
-    - Positives: all provided positive pairs (same particle).
-    - Negatives: top-N highest-scoring masked entries not in the positive set, with N = #positives.
-    - Masking: restrict to a window up to max positive index and to columns involved in positives.
-
-        Args:
-            attention_map_bin: `[seq_len, seq_len]` attention logits matrix.
-            pairs1: `[N_pairs]` first indices for positive pairs.
-            pairs2: `[N_pairs]` second indices for positive pairs.
-            target: `[N_pairs]` labels where positives are `+1` (others ignored).
-
-        Note:
-            Provide symmetric positive pairs `(i, j)` and `(j, i)` only; exclude `(i, i)`.
-
-    Returns:
-        Scalar attention loss tensor
+    - Positives: provided same-particle pairs.
+    - Negatives: top-N highest-scoring masked entries not in the positive set.
+    - N negatives = number of positives, when enough negatives exist.
     """
     device = attention_map_bin.device
-    pos_mask = target > 0
-    if not torch.any(pos_mask):
-        return torch.tensor(0.0, device=device)
 
-    # Save per-pair weights (1 for normal, 100 for PV) before indexing
+    pos_mask = target > 0
+
+    if not torch.any(pos_mask):
+        loss = torch.tensor(0.0, device=device)
+
+        if return_debug:
+            debug_info = {
+                "positive_scores": torch.empty(
+                    0,
+                    device=device,
+                    dtype=attention_map_bin.dtype,
+                ),
+                "negative_scores": torch.empty(
+                    0,
+                    device=device,
+                    dtype=attention_map_bin.dtype,
+                ),
+            }
+            return loss, debug_info
+
+        return loss
+
+    # Positive pair weights.
     pair_weights_pos = target[pos_mask].abs().float()
 
-    # Hits involved in positives and valid window size
-    pos_hits = torch.unique(torch.cat([pairs1[pos_mask], pairs2[pos_mask]])) # even if the attention matrix is not symmetric, the pairs of hits are, so why are we concatenating pairs1 and pairs2
+    # Hits involved in positives.
+    pos_hits = torch.unique(
+        torch.cat(
+            [
+                pairs1[pos_mask],
+                pairs2[pos_mask],
+            ]
+        )
+    )
+
     num_valid_hits = int(torch.max(pos_hits).item()) + 1
 
-    # Build window + column mask focusing around positives
-    full_mask = torch.ones_like(attention_map_bin, dtype=torch.bool)
+    # Build mask for allowed negative candidates.
+    full_mask = torch.ones_like(
+        attention_map_bin,
+        dtype=torch.bool,
+        device=device,
+    )
+
     full_mask[num_valid_hits:, :] = False
     full_mask[:, num_valid_hits:] = False
 
-    inactive_cols = torch.ones(attention_map_bin.shape[0], dtype=torch.bool, device=device)
+    inactive_cols = torch.ones(
+        attention_map_bin.shape[0],
+        dtype=torch.bool,
+        device=device,
+    )
     inactive_cols[pos_hits] = False
-    full_mask[:, inactive_cols] = False # if I don't have orphan hits, but only real hits and padding hits, and padding hits are added at the end of events, then num_valid_hits on full_mask is sufficient, we don't need inactive_cols no ? 
+    full_mask[:, inactive_cols] = False
 
-    # Positive logits
-    pos_i = pairs1[pos_mask]
-    pos_j = pairs2[pos_mask]
+    pos_i = pairs1[pos_mask].long()
+    pos_j = pairs2[pos_mask].long()
+
     pos_scores = attention_map_bin[pos_i, pos_j]
     num_pos = pos_scores.numel()
 
-    # Negative candidates = masked entries excluding positives
+    # Negative candidates = masked entries excluding positives and diagonal
     neg_mask = full_mask.clone()
+
     neg_mask[pos_i, pos_j] = False
-    diag = torch.arange(attention_map_bin.shape[0], device=device)
-    neg_mask[diag, diag]= False
+
+    diag = torch.arange(
+        attention_map_bin.shape[0],
+        device=device,
+    )
+    neg_mask[diag, diag] = False
+
+    neg_mask = neg_mask & torch.isfinite(attention_map_bin)
+
     neg_scores = attention_map_bin[neg_mask]
 
-    k = min(num_pos, neg_scores.numel()) # usually there are more neg_scores than pos_scores
-    top_neg_scores, _ = torch.topk(neg_scores, k=k, largest=True, sorted=False)
+    k = min(num_pos, neg_scores.numel())
 
-    logits = torch.cat([pos_scores, top_neg_scores], dim=0)
+    if k == 0:
+        top_neg_scores = torch.empty(
+            0,
+            device=device,
+            dtype=attention_map_bin.dtype,
+        )
+    else:
+        top_neg_scores, _ = torch.topk(
+            neg_scores,
+            k=k,
+            largest=True,
+            sorted=False,
+        )
+
+    logits = torch.cat(
+        [
+            pos_scores,
+            top_neg_scores,
+        ],
+        dim=0,
+    )
+
     targets = torch.cat(
         [
             torch.ones(num_pos, device=device),
@@ -184,22 +236,42 @@ def top_attention_loss(
         ],
         dim=0,
     )
-    # Class-balanced weights scaled by per-pair weight (PV pairs contribute more)
+
+    # Class-balanced weights
     pos_weight = 1.0 / max(num_pos, 1)
     neg_weight = 1.0 / max(top_neg_scores.numel(), 1)
+
     pos_weights = pos_weight * pair_weights_pos
-    neg_weights = torch.full((top_neg_scores.numel(),), neg_weight, device=device)
-    weights = torch.cat([pos_weights, neg_weights], dim=0)
-    
+
+    neg_weights = torch.full(
+        (top_neg_scores.numel(),),
+        neg_weight,
+        device=device,
+    )
+
+    weights = torch.cat(
+        [
+            pos_weights,
+            neg_weights,
+        ],
+        dim=0,
+    )
+
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        weight=weights,
+        reduction="sum",
+    )
+
     if return_debug:
         debug_info = {
-        "positive_scores": positive_scores.detach(),
-        "negative_scores": negative_scores.detach(),
-    }
+            "positive_scores": pos_scores.detach(),
+            "negative_scores": top_neg_scores.detach(),
+        }
         return loss, debug_info
-    
-    return F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
 
+    return loss
 
 def attention_next_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
