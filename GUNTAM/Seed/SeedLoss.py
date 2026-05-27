@@ -118,6 +118,7 @@ def top_attention_loss(
     pairs1: torch.Tensor,  # [N_pairs] first hit indices of each pair
     pairs2: torch.Tensor,  # [N_pairs] second hit indices of each pair
     target: torch.Tensor,  # [N_pairs] target labels (0 or 1)
+    return_debug=False,
 ) -> torch.Tensor:
     """
     Top-k attention loss using BCE-with-logits on masked entries, styled like full_attention_loss.
@@ -189,6 +190,14 @@ def top_attention_loss(
     pos_weights = pos_weight * pair_weights_pos
     neg_weights = torch.full((top_neg_scores.numel(),), neg_weight, device=device)
     weights = torch.cat([pos_weights, neg_weights], dim=0)
+    
+    if return_debug:
+    debug_info = {
+        "positive_scores": positive_scores.detach(),
+        "negative_scores": negative_scores.detach(),
+    }
+    return loss, debug_info
+    
     return F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
 
 

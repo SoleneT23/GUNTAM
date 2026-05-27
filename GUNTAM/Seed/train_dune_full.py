@@ -331,19 +331,69 @@ def main():
                         pairs2=pairs2,
                     )
 
-                loss = top_attention_loss(
-                    attention_map,
-                    pairs1,
-                    pairs2,
-                    target,
-                )
+                if global_step % 100 == 0:
+                    loss, loss_debug = top_attention_loss(
+                        attention_map,
+                        pairs1,
+                        pairs2,
+                        target,
+                        return_debug=True,
+                    )
+                else:
+                    loss = top_attention_loss(
+                        attention_map,
+                        pairs1,
+                        pairs2,
+                        target,
+                    )
+                    loss_debug = None
 
+                
                 if not torch.isfinite(loss):
                     raise RuntimeError(
                         f"Non-finite loss at epoch={epoch}, "
                         f"file_idx={file_idx}, event_idx={event_idx}: {loss.item()}"
                     )
 
+                if loss_debug is not None:
+                    positive_scores = loss_debug["positive_scores"]
+                    negative_scores = loss_debug["negative_scores"]
+
+                    positive_scores = positive_scores[torch.isfinite(positive_scores)]
+                    negative_scores = negative_scores[torch.isfinite(negative_scores)]
+
+                    print("loss-selected score stats:")
+
+                    print("  positive entries:", positive_scores.numel())
+                    if positive_scores.numel() > 0:
+                        print("  positive logits min:", positive_scores.min().item())
+                        print("  positive logits max:", positive_scores.max().item())
+                        print("  positive logits mean:", positive_scores.mean().item())
+                        print("  positive logits std:", positive_scores.std().item())
+
+                        positive_sigmoid = torch.sigmoid(positive_scores)
+                        print("  positive sigmoid mean:", positive_sigmoid.mean().item())
+                        print("  positive sigmoid std:", positive_sigmoid.std().item())
+
+                    print("  negative entries:", negative_scores.numel())
+                    if negative_scores.numel() > 0:
+                        print("  negative logits min:", negative_scores.min().item())
+                        print("  negative logits max:", negative_scores.max().item())
+                        print("  negative logits mean:", negative_scores.mean().item())
+                        print("  negative logits std:", negative_scores.std().item())
+
+                        negative_sigmoid = torch.sigmoid(negative_scores)
+                        print("  negative sigmoid mean:", negative_sigmoid.mean().item())
+                        print("  negative sigmoid std:", negative_sigmoid.std().item())
+
+                    if positive_scores.numel() > 0 and negative_scores.numel() > 0:
+                        print(
+                            "  sigmoid gap positive-minus-negative:",
+                            torch.sigmoid(positive_scores).mean().item()
+                            - torch.sigmoid(negative_scores).mean().item(),
+                        )
+                
+                
                 loss.backward()
 
                 if global_step % 100 == 0:
