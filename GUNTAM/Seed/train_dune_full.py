@@ -185,15 +185,15 @@ def main():
     cfg.regression = False
 
     # Full training settings.
-    num_epochs = 1
+    num_epochs = 10
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
 
     print_every = 50
 
-    checkpoint_dir = "/gpfs/workdir/thibauts/dune_training_checkpoints_E1_P2000_lr1e-3"
-    attention_plot_dir = "/gpfs/workdir/thibauts/attention_plots_E1_P2000_lr1e-3"
+    checkpoint_dir = "/gpfs/workdir/thibauts/dune_training_checkpoints_E10_P2000_lr1e-3"
+    attention_plot_dir = "/gpfs/workdir/thibauts/attention_plots_E10_P2000_lr1e-3"
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(attention_plot_dir, exist_ok=True)
