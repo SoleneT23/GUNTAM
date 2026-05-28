@@ -10,6 +10,14 @@ from GUNTAM.Seed.SeedLoss import top_attention_loss
 from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
 
+def get_hard_negative_fraction(epoch: int) -> float:
+    if epoch < 1:
+        return 0.0
+    if epoch < 5:
+        return 0.1
+    return 0.2
+
+
 def save_attention_heatmap(
     model,
     dataset,
@@ -28,8 +36,8 @@ def save_attention_heatmap(
     hits_tensor = file_data["hits_tensor"]
     padding_mask = file_data["padding_mask"]
 
-    batched_hits_cpu = hits_tensor[event_idx]       # [1, 5000, 3]
-    batched_mask_cpu = padding_mask[event_idx]      # [1, 5000]
+    batched_hits_cpu = hits_tensor[event_idx]
+    batched_mask_cpu = padding_mask[event_idx]
 
     batched_hits = batched_hits_cpu.to(cfg.device_acc, dtype=model.dtype)
     batched_mask = batched_mask_cpu.to(cfg.device_acc)
@@ -47,7 +55,6 @@ def save_attention_heatmap(
 
     attention_map = torch.sigmoid(attention_map.detach().cpu())
 
-    # Remove padding hits.
     padding_mask_cpu = batched_mask_cpu.detach().cpu()
     real_hit_mask = ~padding_mask_cpu[0]
 
@@ -105,8 +112,6 @@ def save_attention_heatmap(
 def print_attention_debug(attention_map, batched_mask, pairs1, pairs2):
     print("raw attention logits stats on real-hit square:")
 
-    # batched_mask shape: [1, 5000]
-    # True = padding, False = real hit
     real_hit_mask = ~batched_mask[0]
     real_attention = attention_map[real_hit_mask][:, real_hit_mask]
 
@@ -149,6 +154,49 @@ def print_attention_debug(attention_map, batched_mask, pairs1, pairs2):
         print("  std:", pos_sig.std().item())
 
 
+def print_loss_debug(loss_debug):
+    if loss_debug is None:
+        return
+
+    positive_scores = loss_debug["positive_scores"]
+    negative_scores = loss_debug["negative_scores"]
+
+    positive_scores = positive_scores[torch.isfinite(positive_scores)]
+    negative_scores = negative_scores[torch.isfinite(negative_scores)]
+
+    print("loss-selected score stats:")
+    print("  positive entries:", positive_scores.numel())
+
+    if positive_scores.numel() > 0:
+        print("  positive logits min:", positive_scores.min().item())
+        print("  positive logits max:", positive_scores.max().item())
+        print("  positive logits mean:", positive_scores.mean().item())
+        print("  positive logits std:", positive_scores.std().item())
+
+        positive_sigmoid = torch.sigmoid(positive_scores)
+        print("  positive sigmoid mean:", positive_sigmoid.mean().item())
+        print("  positive sigmoid std:", positive_sigmoid.std().item())
+
+    print("  negative entries:", negative_scores.numel())
+
+    if negative_scores.numel() > 0:
+        print("  negative logits min:", negative_scores.min().item())
+        print("  negative logits max:", negative_scores.max().item())
+        print("  negative logits mean:", negative_scores.mean().item())
+        print("  negative logits std:", negative_scores.std().item())
+
+        negative_sigmoid = torch.sigmoid(negative_scores)
+        print("  negative sigmoid mean:", negative_sigmoid.mean().item())
+        print("  negative sigmoid std:", negative_sigmoid.std().item())
+
+    if positive_scores.numel() > 0 and negative_scores.numel() > 0:
+        print(
+            "  sigmoid gap positive-minus-negative:",
+            torch.sigmoid(positive_scores).mean().item()
+            - torch.sigmoid(negative_scores).mean().item(),
+        )
+
+
 def print_gradient_debug(model):
     print("Gradient check:")
 
@@ -173,10 +221,9 @@ def main():
     cfg.cosine_processing = []
 
     cfg.fourier_num_frequencies = [10, 10, 10]
-    cfg.dim_max = [500.0, 500.0, 500.0] 
+    cfg.dim_max = [500.0, 500.0, 500.0]
     cfg.shift = [0.0, 0.0, 0.0]
 
-    # Model settings.
     cfg.dim_embedding = 128
     cfg.nb_layers_t = 2
     cfg.feed_forward_ratio = 4
@@ -184,7 +231,6 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    # Full training settings.
     num_epochs = 10
     max_positive_pairs = 2000
     learning_rate = 1e-3
@@ -192,8 +238,8 @@ def main():
 
     print_every = 50
 
-    checkpoint_dir = "/gpfs/workdir/thibauts/dune_training_checkpoints_E10_P2000_lr1e-3"
-    attention_plot_dir = "/gpfs/workdir/thibauts/attention_plots_E10_P2000_lr1e-3"
+    checkpoint_dir = "/gpfs/workdir/thibauts/dune_training_checkpoints_E10_P2000_lr1e-3_curriculum"
+    attention_plot_dir = "/gpfs/workdir/thibauts/attention_plots_E10_P2000_lr1e-3_curriculum"
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(attention_plot_dir, exist_ok=True)
@@ -249,6 +295,10 @@ def main():
     print("weight_decay:", weight_decay)
     print("checkpoint_dir:", checkpoint_dir)
     print("attention_plot_dir:", attention_plot_dir)
+    print("hard negative phases:")
+    print("  epoch 1: hard_negative_fraction = 0.0")
+    print("  epochs 2-5: hard_negative_fraction = 0.1")
+    print("  epochs 6-10: hard_negative_fraction = 0.2")
 
     global_step = 0
 
@@ -257,9 +307,12 @@ def main():
         torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(num_epochs):
+        hard_negative_fraction = get_hard_negative_fraction(epoch)
+
         print()
         print("=" * 80)
         print(f"Epoch {epoch + 1}/{num_epochs}")
+        print("hard_negative_fraction:", hard_negative_fraction)
         print("=" * 80)
 
         model.train()
@@ -288,9 +341,9 @@ def main():
             n_events = hits_tensor.shape[0]
 
             for event_idx in range(n_events):
-                batched_hits_cpu = hits_tensor[event_idx]                  # [1, 5000, 3]
-                batched_mask_cpu = padding_mask[event_idx]                 # [1, 5000]
-                particle_ids_cpu = hit_to_particle_tensor[event_idx, 0]    # [5000, 1]
+                batched_hits_cpu = hits_tensor[event_idx]
+                batched_mask_cpu = padding_mask[event_idx]
+                particle_ids_cpu = hit_to_particle_tensor[event_idx, 0]
 
                 pairs1, pairs2, target = sample_positive_pairs_from_particle_ids(
                     particle_ids_cpu,
@@ -338,6 +391,7 @@ def main():
                         pairs2,
                         target,
                         return_debug=True,
+                        hard_negative_fraction=hard_negative_fraction,
                     )
                 else:
                     loss = top_attention_loss(
@@ -345,10 +399,10 @@ def main():
                         pairs1,
                         pairs2,
                         target,
+                        hard_negative_fraction=hard_negative_fraction,
                     )
                     loss_debug = None
 
-                
                 if not torch.isfinite(loss):
                     raise RuntimeError(
                         f"Non-finite loss at epoch={epoch}, "
@@ -356,44 +410,9 @@ def main():
                     )
 
                 if loss_debug is not None:
-                    positive_scores = loss_debug["positive_scores"]
-                    negative_scores = loss_debug["negative_scores"]
+                    print("hard_negative_fraction:", hard_negative_fraction)
+                    print_loss_debug(loss_debug)
 
-                    positive_scores = positive_scores[torch.isfinite(positive_scores)]
-                    negative_scores = negative_scores[torch.isfinite(negative_scores)]
-
-                    print("loss-selected score stats:")
-
-                    print("  positive entries:", positive_scores.numel())
-                    if positive_scores.numel() > 0:
-                        print("  positive logits min:", positive_scores.min().item())
-                        print("  positive logits max:", positive_scores.max().item())
-                        print("  positive logits mean:", positive_scores.mean().item())
-                        print("  positive logits std:", positive_scores.std().item())
-
-                        positive_sigmoid = torch.sigmoid(positive_scores)
-                        print("  positive sigmoid mean:", positive_sigmoid.mean().item())
-                        print("  positive sigmoid std:", positive_sigmoid.std().item())
-
-                    print("  negative entries:", negative_scores.numel())
-                    if negative_scores.numel() > 0:
-                        print("  negative logits min:", negative_scores.min().item())
-                        print("  negative logits max:", negative_scores.max().item())
-                        print("  negative logits mean:", negative_scores.mean().item())
-                        print("  negative logits std:", negative_scores.std().item())
-
-                        negative_sigmoid = torch.sigmoid(negative_scores)
-                        print("  negative sigmoid mean:", negative_sigmoid.mean().item())
-                        print("  negative sigmoid std:", negative_sigmoid.std().item())
-
-                    if positive_scores.numel() > 0 and negative_scores.numel() > 0:
-                        print(
-                            "  sigmoid gap positive-minus-negative:",
-                            torch.sigmoid(positive_scores).mean().item()
-                            - torch.sigmoid(negative_scores).mean().item(),
-                        )
-                
-                
                 loss.backward()
 
                 if global_step % 100 == 0:
@@ -416,6 +435,7 @@ def main():
                         f"file_idx={file_idx} | "
                         f"event_idx={event_idx}"
                     )
+                    print("hard_negative_fraction:", hard_negative_fraction)
                     print("sampled positive pairs:", pairs1.numel())
                     print("loss:", loss_value)
 
@@ -445,6 +465,7 @@ def main():
         print()
         print("=" * 80)
         print(f"Epoch {epoch + 1} summary")
+        print("hard_negative_fraction:", hard_negative_fraction)
         print("successful_events:", successful_events)
         print("skipped_events:", skipped_events)
         print("average_loss:", avg_loss)
@@ -466,6 +487,7 @@ def main():
             {
                 "epoch": epoch + 1,
                 "global_step": global_step,
+                "hard_negative_fraction": hard_negative_fraction,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
