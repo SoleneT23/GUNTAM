@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 
+
 def attention_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
     pairs1: torch.Tensor,  # [N_pairs] first hit indices of each pair

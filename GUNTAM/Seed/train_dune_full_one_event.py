@@ -198,7 +198,6 @@ def save_attention_heatmap(
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
 
-
 def main():
     cfg = SeedConfig()
 
@@ -212,19 +211,22 @@ def main():
     cfg.cosine_processing = []
 
     cfg.fourier_num_frequencies = [10, 10, 10]
+
+   
+    # raw coordinates are on the scale of hundreds
+    # test [500.0, 500.0, 500.0].
     cfg.dim_max = [1.0, 1.0, 1.0]
+
     cfg.shift = [0.0, 0.0, 0.0]
 
-    # Model settings.
+   
     cfg.dim_embedding = 128
     cfg.nb_layers_t = 2
     cfg.feed_forward_ratio = 4
     cfg.nb_heads = 4
     cfg.dropout = 0.1
     cfg.regression = False
-
-    # One-event overfit settings.
-    # The goal is to check whether the model/loss can memorize one event.
+    
     num_steps = 1000
     overfit_file_idx = 0
     overfit_event_idx = 0
@@ -300,6 +302,9 @@ def main():
     print("weight_decay:", weight_decay)
     print("checkpoint_dir:", checkpoint_dir)
     print("attention_plot_dir:", attention_plot_dir)
+    print("hard-negative curriculum:")
+    print("  steps 0-499:   hard_negative_fraction = 0.0")
+    print("  steps 500-999: hard_negative_fraction = 0.05")
 
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
@@ -374,6 +379,7 @@ def main():
     batched_mask = batched_mask_cpu.to(cfg.device_acc)
 
     loss_history = []
+    hard_negative_fraction_history = []
 
     print()
     print("=" * 80)
@@ -410,6 +416,13 @@ def main():
         pairs2 = pairs2_cpu.to(cfg.device_acc).long()
         target = target_cpu.to(cfg.device_acc).float()
 
+        if step < 500:
+            hard_negative_fraction = 0.0
+        else:
+            hard_negative_fraction = 0.05
+
+        hard_negative_fraction_history.append(hard_negative_fraction)
+
         optimizer.zero_grad(set_to_none=True)
 
         encoded_space_points, attention_weights = model(
@@ -422,10 +435,6 @@ def main():
         if attention_map.dim() == 3:
             attention_map = attention_map[0]
 
-        # This assumes you modified top_attention_loss so that:
-        #   top_attention_loss(..., return_debug=True)
-        # returns:
-        #   loss, {"positive_scores": ..., "negative_scores": ...}
         if step % print_every == 0:
             loss, loss_debug = top_attention_loss(
                 attention_map,
@@ -433,6 +442,7 @@ def main():
                 pairs2,
                 target,
                 return_debug=True,
+                hard_negative_fraction=hard_negative_fraction,
             )
         else:
             loss = top_attention_loss(
@@ -440,6 +450,7 @@ def main():
                 pairs1,
                 pairs2,
                 target,
+                hard_negative_fraction=hard_negative_fraction,
             )
             loss_debug = None
 
@@ -454,6 +465,7 @@ def main():
             print()
             print("-" * 80)
             print(f"overfit step={step} | loss={loss.item()}")
+            print("hard_negative_fraction:", hard_negative_fraction)
 
             print_attention_debug(
                 attention_map=attention_map,
@@ -488,6 +500,8 @@ def main():
     print("last loss:", loss_history[-1])
     print("min loss:", min(loss_history))
     print("max loss:", max(loss_history))
+    print("first hard_negative_fraction:", hard_negative_fraction_history[0])
+    print("last hard_negative_fraction:", hard_negative_fraction_history[-1])
 
     if cfg.device_acc.type == "cuda":
         print(
@@ -503,7 +517,8 @@ def main():
             f"dune_seed_transformer_overfit"
             f"_file{overfit_file_idx}"
             f"_event{overfit_event_idx}"
-            f"_steps{num_steps}.pt"
+            f"_steps{num_steps}"
+            f"_curriculum_random_then_hard005.pt"
         ),
     )
 
@@ -515,6 +530,7 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss_history": loss_history,
+            "hard_negative_fraction_history": hard_negative_fraction_history,
             "cfg": cfg,
         },
         checkpoint_path,
