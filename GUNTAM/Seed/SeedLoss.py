@@ -119,16 +119,22 @@ def top_attention_loss(
     pairs2: torch.Tensor,             # [N_pairs] second hit indices of each pair
     target: torch.Tensor,             # [N_pairs] target labels
     return_debug=False,
+    hard_negative_fraction: float = 0.2,
 ) -> torch.Tensor:
     """
     Attention loss using BCE-with-logits.
 
     - Positives: provided same-particle pairs.
-    - Negatives: randomly sampled masked entries not in the positive set.
-    - Number of negatives = number of positives, when enough negatives exist.
+    - Negatives: mixture of random negatives and hard negatives.
+    - Total number of negatives = number of positives, when enough negatives exist.
+
+    hard_negative_fraction controls the fraction of selected negatives that are hard negatives.
 
     """
     device = attention_map_bin.device
+
+    if attention_map_bin.dim() == 3:
+        attention_map_bin = attention_map_bin[0]
 
     pos_mask = target > 0
 
@@ -147,19 +153,30 @@ def top_attention_loss(
                     device=device,
                     dtype=attention_map_bin.dtype,
                 ),
+                "random_negative_scores": torch.empty(
+                    0,
+                    device=device,
+                    dtype=attention_map_bin.dtype,
+                ),
+                "hard_negative_scores": torch.empty(
+                    0,
+                    device=device,
+                    dtype=attention_map_bin.dtype,
+                ),
             }
             return loss, debug_info
 
         return loss
 
-    # Positive pair weights
+   
+    
     pair_weights_pos = target[pos_mask].abs().float()
 
-    # Positive indices
+  
     pos_i = pairs1[pos_mask].long()
     pos_j = pairs2[pos_mask].long()
 
-    # Hits involved in positives
+   
     pos_hits = torch.unique(
         torch.cat(
             [
@@ -191,48 +208,126 @@ def top_attention_loss(
     inactive_cols[pos_hits] = False
     full_mask[:, inactive_cols] = False
 
-    # Positive logits
     pos_scores = attention_map_bin[pos_i, pos_j]
     num_pos = pos_scores.numel()
 
-    # Negative candidates = masked entries excluding positives and diagonal.
+
     neg_mask = full_mask.clone()
 
-   
     neg_mask[pos_i, pos_j] = False
 
-
+  
     diag = torch.arange(
         attention_map_bin.shape[0],
         device=device,
     )
     neg_mask[diag, diag] = False
 
+   
     neg_mask = neg_mask & torch.isfinite(attention_map_bin)
 
     neg_scores = attention_map_bin[neg_mask]
 
-    k = min(num_pos, neg_scores.numel())
+    total_num_neg = min(num_pos, neg_scores.numel())
 
-    if k == 0:
+    if total_num_neg == 0:
         random_neg_scores = torch.empty(
             0,
             device=device,
             dtype=attention_map_bin.dtype,
         )
-    else:
-        # Random negatives instead of hard top-k negatives.
-        random_indices = torch.randperm(
-            neg_scores.numel(),
+        hard_neg_scores = torch.empty(
+            0,
             device=device,
-        )[:k]
+            dtype=attention_map_bin.dtype,
+        )
+        mixed_neg_scores = torch.empty(
+            0,
+            device=device,
+            dtype=attention_map_bin.dtype,
+        )
 
-        random_neg_scores = neg_scores[random_indices]
+    else:
+       
+        hard_negative_fraction = max(
+            0.0,
+            min(1.0, float(hard_negative_fraction)),
+        )
+
+        num_hard = int(total_num_neg * hard_negative_fraction)
+        num_random = total_num_neg - num_hard
+
+     
+        if num_hard > 0:
+            hard_neg_scores, hard_indices = torch.topk(
+                neg_scores,
+                k=num_hard,
+                largest=True,
+                sorted=False,
+            )
+        else:
+            hard_neg_scores = torch.empty(
+                0,
+                device=device,
+                dtype=attention_map_bin.dtype,
+            )
+            hard_indices = torch.empty(
+                0,
+                device=device,
+                dtype=torch.long,
+            )
+
+    
+        if num_random > 0:
+            remaining_mask = torch.ones(
+                neg_scores.numel(),
+                dtype=torch.bool,
+                device=device,
+            )
+
+            if hard_indices.numel() > 0:
+                remaining_mask[hard_indices] = False
+
+            remaining_scores = neg_scores[remaining_mask]
+
+            if remaining_scores.numel() == 0:
+                random_neg_scores = torch.empty(
+                    0,
+                    device=device,
+                    dtype=attention_map_bin.dtype,
+                )
+            else:
+                actual_num_random = min(
+                    num_random,
+                    remaining_scores.numel(),
+                )
+
+                random_indices = torch.randperm(
+                    remaining_scores.numel(),
+                    device=device,
+                )[:actual_num_random]
+
+                random_neg_scores = remaining_scores[random_indices]
+        else:
+            random_neg_scores = torch.empty(
+                0,
+                device=device,
+                dtype=attention_map_bin.dtype,
+            )
+
+        
+        mixed_neg_scores = torch.cat(
+            [
+                random_neg_scores,
+                hard_neg_scores,
+            ],
+            dim=0,
+        )
 
     logits = torch.cat(
         [
             pos_scores,
-            random_neg_scores,
+            mixed_neg_scores,
         ],
         dim=0,
     )
@@ -240,19 +335,19 @@ def top_attention_loss(
     targets = torch.cat(
         [
             torch.ones(num_pos, device=device),
-            torch.zeros(random_neg_scores.numel(), device=device),
+            torch.zeros(mixed_neg_scores.numel(), device=device),
         ],
         dim=0,
     )
 
-    # Class-balanced weights
+    # Class-balanced weights.
     pos_weight = 1.0 / max(num_pos, 1)
-    neg_weight = 1.0 / max(random_neg_scores.numel(), 1)
+    neg_weight = 1.0 / max(mixed_neg_scores.numel(), 1)
 
     pos_weights = pos_weight * pair_weights_pos
 
     neg_weights = torch.full(
-        (random_neg_scores.numel(),),
+        (mixed_neg_scores.numel(),),
         neg_weight,
         device=device,
     )
@@ -275,7 +370,9 @@ def top_attention_loss(
     if return_debug:
         debug_info = {
             "positive_scores": pos_scores.detach(),
-            "negative_scores": random_neg_scores.detach(),
+            "negative_scores": mixed_neg_scores.detach(),
+            "random_negative_scores": random_neg_scores.detach(),
+            "hard_negative_scores": hard_neg_scores.detach(),
         }
         return loss, debug_info
 

@@ -173,7 +173,7 @@ def main():
     cfg.cosine_processing = []
 
     cfg.fourier_num_frequencies = [10, 10, 10]
-    cfg.dim_max = [1.0, 1.0, 1.0]
+    cfg.dim_max = [500.0, 500.0, 500.0] 
     cfg.shift = [0.0, 0.0, 0.0]
 
     # Model settings.
