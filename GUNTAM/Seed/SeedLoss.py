@@ -121,11 +121,12 @@ def top_attention_loss(
     return_debug=False,
 ) -> torch.Tensor:
     """
-    Top-k attention loss using BCE-with-logits.
+    Attention loss using BCE-with-logits.
 
     - Positives: provided same-particle pairs.
-    - Negatives: top-N highest-scoring masked entries not in the positive set.
-    - N negatives = number of positives, when enough negatives exist.
+    - Negatives: randomly sampled masked entries not in the positive set.
+    - Number of negatives = number of positives, when enough negatives exist.
+
     """
     device = attention_map_bin.device
 
@@ -151,31 +152,37 @@ def top_attention_loss(
 
         return loss
 
-    # Positive pair weights.
+    # Positive pair weights
     pair_weights_pos = target[pos_mask].abs().float()
 
-    # Hits involved in positives.
+    # Positive indices
+    pos_i = pairs1[pos_mask].long()
+    pos_j = pairs2[pos_mask].long()
+
+    # Hits involved in positives
     pos_hits = torch.unique(
         torch.cat(
             [
-                pairs1[pos_mask],
-                pairs2[pos_mask],
+                pos_i,
+                pos_j,
             ]
         )
     )
 
     num_valid_hits = int(torch.max(pos_hits).item()) + 1
 
-    # Build mask for allowed negative candidates.
+    # Build mask for allowed negative candidates
     full_mask = torch.ones_like(
         attention_map_bin,
         dtype=torch.bool,
         device=device,
     )
 
+    # Keep only the square [0:num_valid_hits, 0:num_valid_hits]
     full_mask[num_valid_hits:, :] = False
     full_mask[:, num_valid_hits:] = False
 
+    # Keep only columns corresponding to hits involved in positives
     inactive_cols = torch.ones(
         attention_map_bin.shape[0],
         dtype=torch.bool,
@@ -184,16 +191,16 @@ def top_attention_loss(
     inactive_cols[pos_hits] = False
     full_mask[:, inactive_cols] = False
 
-    pos_i = pairs1[pos_mask].long()
-    pos_j = pairs2[pos_mask].long()
-
+    # Positive logits
     pos_scores = attention_map_bin[pos_i, pos_j]
     num_pos = pos_scores.numel()
 
-    # Negative candidates = masked entries excluding positives and diagonal
+    # Negative candidates = masked entries excluding positives and diagonal.
     neg_mask = full_mask.clone()
 
+   
     neg_mask[pos_i, pos_j] = False
+
 
     diag = torch.arange(
         attention_map_bin.shape[0],
@@ -208,23 +215,24 @@ def top_attention_loss(
     k = min(num_pos, neg_scores.numel())
 
     if k == 0:
-        top_neg_scores = torch.empty(
+        random_neg_scores = torch.empty(
             0,
             device=device,
             dtype=attention_map_bin.dtype,
         )
     else:
-        top_neg_scores, _ = torch.topk(
-            neg_scores,
-            k=k,
-            largest=True,
-            sorted=False,
-        )
+        # Random negatives instead of hard top-k negatives.
+        random_indices = torch.randperm(
+            neg_scores.numel(),
+            device=device,
+        )[:k]
+
+        random_neg_scores = neg_scores[random_indices]
 
     logits = torch.cat(
         [
             pos_scores,
-            top_neg_scores,
+            random_neg_scores,
         ],
         dim=0,
     )
@@ -232,19 +240,19 @@ def top_attention_loss(
     targets = torch.cat(
         [
             torch.ones(num_pos, device=device),
-            torch.zeros(top_neg_scores.numel(), device=device),
+            torch.zeros(random_neg_scores.numel(), device=device),
         ],
         dim=0,
     )
 
     # Class-balanced weights
     pos_weight = 1.0 / max(num_pos, 1)
-    neg_weight = 1.0 / max(top_neg_scores.numel(), 1)
+    neg_weight = 1.0 / max(random_neg_scores.numel(), 1)
 
     pos_weights = pos_weight * pair_weights_pos
 
     neg_weights = torch.full(
-        (top_neg_scores.numel(),),
+        (random_neg_scores.numel(),),
         neg_weight,
         device=device,
     )
@@ -267,7 +275,7 @@ def top_attention_loss(
     if return_debug:
         debug_info = {
             "positive_scores": pos_scores.detach(),
-            "negative_scores": top_neg_scores.detach(),
+            "negative_scores": random_neg_scores.detach(),
         }
         return loss, debug_info
 
