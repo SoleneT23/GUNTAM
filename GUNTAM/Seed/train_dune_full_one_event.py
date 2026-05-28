@@ -304,7 +304,7 @@ def main():
     print("attention_plot_dir:", attention_plot_dir)
     print("hard-negative curriculum:")
     print("  steps 0-499:   hard_negative_fraction = 0.0")
-    print("  steps 500-999: hard_negative_fraction = 0.10")
+    print("  steps 500-999: hard_negative_fraction = 0.20")
 
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
@@ -419,7 +419,7 @@ def main():
         if step < 500:
             hard_negative_fraction = 0.0
         else:
-            hard_negative_fraction = 0.10
+            hard_negative_fraction = 0.20
 
         hard_negative_fraction_history.append(hard_negative_fraction)
 
