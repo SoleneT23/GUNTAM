@@ -115,141 +115,138 @@ def full_attention_loss(
 
 
 def top_attention_loss(
-    attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
-    pairs1: torch.Tensor,             # [N_pairs] first hit indices of each pair
-    pairs2: torch.Tensor,             # [N_pairs] second hit indices of each pair
-    target: torch.Tensor,             # [N_pairs] target labels
-    return_debug=False,
+    attention_map_bin: torch.Tensor,
+    pairs1: torch.Tensor,
+    pairs2: torch.Tensor,
+    target: torch.Tensor,
+    particle_ids: torch.Tensor,
+    padding_mask: torch.Tensor,
+    return_debug: bool = False,
     hard_negative_fraction: float = 0.2,
 ) -> torch.Tensor:
     """
     Attention loss using BCE-with-logits.
 
-    - Positives: provided same-particle pairs.
-    - Negatives: mixture of random negatives and hard negatives.
-    - Total number of negatives = number of positives, when enough negatives exist.
+    Positives:
+        sampled same-particle pairs given by pairs1, pairs2, target > 0.
 
-    hard_negative_fraction controls the fraction of selected negatives that are hard negatives.
+    Negatives:
+        pairs of real hits whose particle IDs are different.
 
+    Important:
+        They are defined using particle_ids:
+
+            negative pair = real hit i, real hit j, particle_id_i != particle_id_j
     """
+
+
     device = attention_map_bin.device
+    dtype = attention_map_bin.dtype
 
     if attention_map_bin.dim() == 3:
         attention_map_bin = attention_map_bin[0]
 
+    seq_len = attention_map_bin.shape[0]
+
+    particle_ids = particle_ids.to(device)
+
+    if particle_ids.dim() == 3:
+        particle_ids = particle_ids[0, :, 0]
+    elif particle_ids.dim() == 2:
+        particle_ids = particle_ids[:, 0]
+    else:
+        particle_ids = particle_ids.view(-1)
+
+    particle_ids = particle_ids.long()
+
+    padding_mask = padding_mask.to(device)
+
+    if padding_mask.dim() == 2:
+        padding_mask = padding_mask[0]
+    else:
+        padding_mask = padding_mask.view(-1)
+
+    padding_mask = padding_mask.bool()
+
+    real_hit_mask = ~padding_mask
+
+    real_hit_mask = real_hit_mask[:seq_len]
+    particle_ids = particle_ids[:seq_len]
+
     pos_mask = target > 0
 
     if not torch.any(pos_mask):
-        loss = torch.tensor(0.0, device=device)
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
 
         if return_debug:
             debug_info = {
-                "positive_scores": torch.empty(
-                    0,
-                    device=device,
-                    dtype=attention_map_bin.dtype,
-                ),
-                "negative_scores": torch.empty(
-                    0,
-                    device=device,
-                    dtype=attention_map_bin.dtype,
-                ),
-                "random_negative_scores": torch.empty(
-                    0,
-                    device=device,
-                    dtype=attention_map_bin.dtype,
-                ),
-                "hard_negative_scores": torch.empty(
-                    0,
-                    device=device,
-                    dtype=attention_map_bin.dtype,
-                ),
+                "positive_scores": torch.empty(0, device=device, dtype=dtype),
+                "negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
             }
             return loss, debug_info
 
         return loss
 
-   
-    
-    pair_weights_pos = target[pos_mask].abs().float()
+    pos_i = pairs1[pos_mask].long().to(device)
+    pos_j = pairs2[pos_mask].long().to(device)
 
-  
-    pos_i = pairs1[pos_mask].long()
-    pos_j = pairs2[pos_mask].long()
+    pair_weights_pos = target[pos_mask].abs().float().to(device)
 
-   
-    pos_hits = torch.unique(
-        torch.cat(
-            [
-                pos_i,
-                pos_j,
-            ]
-        )
+    valid_pos = (
+        (pos_i >= 0)
+        & (pos_i < seq_len)
+        & (pos_j >= 0)
+        & (pos_j < seq_len)
     )
 
-    num_valid_hits = int(torch.max(pos_hits).item()) + 1
+    valid_pos = valid_pos & real_hit_mask[pos_i] & real_hit_mask[pos_j]
+    valid_pos = valid_pos & torch.isfinite(attention_map_bin[pos_i, pos_j])
 
-    # Build mask for allowed negative candidates
-    full_mask = torch.ones_like(
-        attention_map_bin,
-        dtype=torch.bool,
-        device=device,
-    )
+    pos_i = pos_i[valid_pos]
+    pos_j = pos_j[valid_pos]
+    pair_weights_pos = pair_weights_pos[valid_pos]
 
-    # Keep only the square [0:num_valid_hits, 0:num_valid_hits]
-    full_mask[num_valid_hits:, :] = False
-    full_mask[:, num_valid_hits:] = False
+    if pos_i.numel() == 0:
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
 
-    # Keep only columns corresponding to hits involved in positives
-    inactive_cols = torch.ones(
-        attention_map_bin.shape[0],
-        dtype=torch.bool,
-        device=device,
-    )
-    inactive_cols[pos_hits] = False
-    full_mask[:, inactive_cols] = False
+        if return_debug:
+            debug_info = {
+                "positive_scores": torch.empty(0, device=device, dtype=dtype),
+                "negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+            }
+            return loss, debug_info
+
+        return loss
 
     pos_scores = attention_map_bin[pos_i, pos_j]
     num_pos = pos_scores.numel()
 
+    valid_pair_mask = real_hit_mask[:, None] & real_hit_mask[None, :]
+    same_particle_mask = particle_ids[:, None] == particle_ids[None, :]
 
-    neg_mask = full_mask.clone()
+    eye = torch.eye(seq_len, dtype=torch.bool, device=device)
 
-    neg_mask[pos_i, pos_j] = False
-
-  
-    diag = torch.arange(
-        attention_map_bin.shape[0],
-        device=device,
+    neg_mask = (
+        valid_pair_mask
+        & (~same_particle_mask)
+        & (~eye)
+        & torch.isfinite(attention_map_bin)
     )
-    neg_mask[diag, diag] = False
-
-   
-    neg_mask = neg_mask & torch.isfinite(attention_map_bin)
 
     neg_scores = attention_map_bin[neg_mask]
 
     total_num_neg = min(num_pos, neg_scores.numel())
 
     if total_num_neg == 0:
-        random_neg_scores = torch.empty(
-            0,
-            device=device,
-            dtype=attention_map_bin.dtype,
-        )
-        hard_neg_scores = torch.empty(
-            0,
-            device=device,
-            dtype=attention_map_bin.dtype,
-        )
-        mixed_neg_scores = torch.empty(
-            0,
-            device=device,
-            dtype=attention_map_bin.dtype,
-        )
+        random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+        hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
+        mixed_neg_scores = torch.empty(0, device=device, dtype=dtype)
 
     else:
-       
         hard_negative_fraction = max(
             0.0,
             min(1.0, float(hard_negative_fraction)),
@@ -258,7 +255,6 @@ def top_attention_loss(
         num_hard = int(total_num_neg * hard_negative_fraction)
         num_random = total_num_neg - num_hard
 
-     
         if num_hard > 0:
             hard_neg_scores, hard_indices = torch.topk(
                 neg_scores,
@@ -267,18 +263,9 @@ def top_attention_loss(
                 sorted=False,
             )
         else:
-            hard_neg_scores = torch.empty(
-                0,
-                device=device,
-                dtype=attention_map_bin.dtype,
-            )
-            hard_indices = torch.empty(
-                0,
-                device=device,
-                dtype=torch.long,
-            )
+            hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
+            hard_indices = torch.empty(0, device=device, dtype=torch.long)
 
-    
         if num_random > 0:
             remaining_mask = torch.ones(
                 neg_scores.numel(),
@@ -292,11 +279,7 @@ def top_attention_loss(
             remaining_scores = neg_scores[remaining_mask]
 
             if remaining_scores.numel() == 0:
-                random_neg_scores = torch.empty(
-                    0,
-                    device=device,
-                    dtype=attention_map_bin.dtype,
-                )
+                random_neg_scores = torch.empty(0, device=device, dtype=dtype)
             else:
                 actual_num_random = min(
                     num_random,
@@ -309,14 +292,10 @@ def top_attention_loss(
                 )[:actual_num_random]
 
                 random_neg_scores = remaining_scores[random_indices]
-        else:
-            random_neg_scores = torch.empty(
-                0,
-                device=device,
-                dtype=attention_map_bin.dtype,
-            )
 
-        
+        else:
+            random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+
         mixed_neg_scores = torch.cat(
             [
                 random_neg_scores,
@@ -335,22 +314,22 @@ def top_attention_loss(
 
     targets = torch.cat(
         [
-            torch.ones(num_pos, device=device),
-            torch.zeros(mixed_neg_scores.numel(), device=device),
+            torch.ones(num_pos, device=device, dtype=dtype),
+            torch.zeros(mixed_neg_scores.numel(), device=device, dtype=dtype),
         ],
         dim=0,
     )
 
-    # Class-balanced weights.
     pos_weight = 1.0 / max(num_pos, 1)
     neg_weight = 1.0 / max(mixed_neg_scores.numel(), 1)
 
-    pos_weights = pos_weight * pair_weights_pos
+    pos_weights = pos_weight * pair_weights_pos.to(dtype)
 
     neg_weights = torch.full(
         (mixed_neg_scores.numel(),),
         neg_weight,
         device=device,
+        dtype=dtype,
     )
 
     weights = torch.cat(
@@ -374,10 +353,20 @@ def top_attention_loss(
             "negative_scores": mixed_neg_scores.detach(),
             "random_negative_scores": random_neg_scores.detach(),
             "hard_negative_scores": hard_neg_scores.detach(),
+            "num_positive_pairs": torch.tensor(num_pos, device=device),
+            "num_negative_candidates": torch.tensor(
+                neg_scores.numel(),
+                device=device,
+            ),
+            "num_selected_negatives": torch.tensor(
+                mixed_neg_scores.numel(),
+                device=device,
+            ),
         }
         return loss, debug_info
 
     return loss
+
 
 def attention_next_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits

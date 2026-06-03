@@ -229,7 +229,7 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    num_epochs = 30
+    num_epochs = 10
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
