@@ -360,6 +360,7 @@ def main():
                 pairs1 = pairs1.to(cfg.device_acc).long()
                 pairs2 = pairs2.to(cfg.device_acc).long()
                 target = target.to(cfg.device_acc).float()
+                particle_ids = particle_ids_cpu.to(cfg.device_acc).long()
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -387,6 +388,8 @@ def main():
                         pairs1,
                         pairs2,
                         target,
+                        particle_ids,
+                        batched_mask,
                         return_debug=True,
                         hard_negative_fraction=hard_negative_fraction,
                     )
@@ -396,6 +399,8 @@ def main():
                         pairs1,
                         pairs2,
                         target,
+                        particle_ids,
+                        batched_mask,
                         hard_negative_fraction=hard_negative_fraction,
                     )
                     loss_debug = None
