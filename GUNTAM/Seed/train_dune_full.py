@@ -229,7 +229,7 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    num_epochs = 10
+    num_epochs = 20
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
@@ -295,7 +295,7 @@ def main():
     print("attention_plot_dir:", attention_plot_dir)
     print("hard negative phases:")
     print("  epochs 1-3: hard_negative_fraction = 0.0")
-    print("  epochs 4-10: hard_negative_fraction = 0.1")
+    print("  epochs 4-20: hard_negative_fraction = 0.1")
 
     global_step = 0
 
