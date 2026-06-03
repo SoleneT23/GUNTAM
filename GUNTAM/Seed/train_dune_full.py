@@ -11,11 +11,9 @@ from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
 
 def get_hard_negative_fraction(epoch: int) -> float:
-    if epoch < 1:
+    if epoch < 3:
         return 0.0
-    if epoch < 5:
-        return 0.1
-    return 0.2
+    return 0.1
 
 
 def save_attention_heatmap(
@@ -296,9 +294,8 @@ def main():
     print("checkpoint_dir:", checkpoint_dir)
     print("attention_plot_dir:", attention_plot_dir)
     print("hard negative phases:")
-    print("  epoch 1: hard_negative_fraction = 0.0")
-    print("  epochs 2-5: hard_negative_fraction = 0.1")
-    print("  epochs 6-10: hard_negative_fraction = 0.2")
+    print("  epochs 1-3: hard_negative_fraction = 0.0")
+    print("  epochs 4-10: hard_negative_fraction = 0.1")
 
     global_step = 0
 
