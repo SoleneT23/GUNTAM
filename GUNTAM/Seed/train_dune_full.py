@@ -11,11 +11,12 @@ from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
 
 def get_hard_negative_fraction(epoch: int) -> float:
-    if epoch < 3:
-        return 0.0
-    if epoch < 20:
-        return 0.1
-    return 0.2
+    # if epoch < 3:
+    #     return 0.0
+    # if epoch < 20:
+    #     return 0.1
+    # return 0.2
+    return 1.0
 
 
 def save_attention_heatmap(
