@@ -11,6 +11,7 @@ _balanced_truncate_event_DETAILS.py
 top_loss_details.py
 top_attention_loss_keep.py
 plots.py
+sigmoid_donnees_E40.txt
 
 .DS_Store
 

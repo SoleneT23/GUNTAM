@@ -25,7 +25,9 @@ def get_hard_negative_fraction(epoch: int) -> float:
         return 0.2
     if epoch < 30:
         return 0.3
-    return 0.4
+    if epoch < 40:
+        return 0.4
+    return 0.5
 
 
 def save_attention_heatmap(
@@ -241,7 +243,7 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    num_epochs = 40
+    num_epochs = 50
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
@@ -310,7 +312,8 @@ def main():
     print("  epochs 4-10: hard_negative_fraction = 0.1")
     print("  epochs 11-20: hard_negative_fraction = 0.2")
     print("  epochs 21-30: hard_negative_fraction = 0.3")
-    print("  epochs 31-40: hard_negative_fraction = 0.3")
+    print("  epochs 31-40: hard_negative_fraction = 0.4")
+    print("  epochs 41-50: hard_negative_fraction = 0.5")
 
     global_step = 0
 
