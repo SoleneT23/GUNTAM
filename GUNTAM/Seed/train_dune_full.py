@@ -16,7 +16,16 @@ def get_hard_negative_fraction(epoch: int) -> float:
     # if epoch < 20:
     #     return 0.1
     # return 0.2
-    return 1.0
+   
+    if epoch < 3:
+        return 0.0
+    if epoch < 10:
+        return 0.1
+    if epoch < 20:
+        return 0.2
+    if epoch < 30:
+        return 0.3
+    return 0.4
 
 
 def save_attention_heatmap(
@@ -232,7 +241,7 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    num_epochs = 30
+    num_epochs = 40
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
@@ -298,8 +307,10 @@ def main():
     print("attention_plot_dir:", attention_plot_dir)
     print("hard negative phases:")
     print("  epochs 1-3: hard_negative_fraction = 0.0")
-    print("  epochs 4-20: hard_negative_fraction = 0.1")
-    print("  epochs 21-30: hard_negative_fraction = 0.2")
+    print("  epochs 4-10: hard_negative_fraction = 0.1")
+    print("  epochs 11-20: hard_negative_fraction = 0.2")
+    print("  epochs 21-30: hard_negative_fraction = 0.3")
+    print("  epochs 31-40: hard_negative_fraction = 0.3")
 
     global_step = 0
 
