@@ -12,6 +12,7 @@ top_loss_details.py
 top_attention_loss_keep.py
 plots.py
 sigmoid_donnees_E40.txt
+old_train_dune_full.py
 
 .DS_Store
 

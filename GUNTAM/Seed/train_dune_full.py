@@ -8,15 +8,28 @@ from GUNTAM.Seed.SeedTransformer import SeedTransformer
 from GUNTAM.Seed.Config import SeedConfig
 from GUNTAM.Seed.SeedLoss import top_attention_loss
 from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
+import os
+import csv
+import argparse
 
 
-def get_hard_negative_fraction(epoch: int) -> float:
-    # if epoch < 3:
-    #     return 0.0
-    # if epoch < 20:
-    #     return 0.1
-    # return 0.2
-   
+import torch.nn.functional as F
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+
+def get_hard_negative_fraction(epoch):
+    """
+    epoch is zero-indexed.
+
+    Therefore:
+        epoch = 0, 1, 2      -> printed epochs 1, 2, 3
+        epoch = 3, ..., 9    -> printed epochs 4, ..., 10
+        etc.
+    """
     if epoch < 3:
         return 0.0
     if epoch < 10:
@@ -30,197 +43,716 @@ def get_hard_negative_fraction(epoch: int) -> float:
     return 0.5
 
 
-def save_attention_heatmap(
+def save_metrics_csv(epoch_history, checkpoint_dir):
+    metrics_csv_path = os.path.join(
+        checkpoint_dir,
+        "training_gap_metrics.csv",
+    )
+
+    with open(metrics_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "hard_negative_fraction",
+                "average_loss",
+                "mean_pos_sigmoid",
+                "mean_random_neg_sigmoid",
+                "gap_pos_random_neg",
+                "successful_events",
+                "skipped_events",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(epoch_history)
+
+    print("Saved metrics CSV:", metrics_csv_path)
+
+
+def save_gap_plot(epoch_history, attention_plot_dir):
+    if len(epoch_history) == 0:
+        return
+
+    epochs_plot = [row["epoch"] for row in epoch_history]
+    gaps_plot = [row["gap_pos_random_neg"] for row in epoch_history]
+    pos_plot = [row["mean_pos_sigmoid"] for row in epoch_history]
+    rand_neg_plot = [row["mean_random_neg_sigmoid"] for row in epoch_history]
+
+    max_epoch = max(epochs_plot)
+
+    plt.figure(figsize=(12, 6))
+
+    phases = [
+        (1, 3, 0.0, "#e0e0e0"),
+        (4, 10, 0.1, "#1f78b4"),
+        (11, 20, 0.2, "#33a02c"),
+        (21, 30, 0.3, "#ff7f00"),
+        (31, 40, 0.4, "#e31a1c"),
+        (41, 50, 0.5, "#6a3d9a"),
+    ]
+
+    for start_epoch, end_epoch, frac, color in phases:
+        if start_epoch <= max_epoch:
+            plt.axvspan(
+                start_epoch - 0.5,
+                min(end_epoch, max_epoch) + 0.5,
+                color=color,
+                alpha=0.22,
+                label=f"hard neg frac = {frac}",
+            )
+
+    plt.plot(
+        epochs_plot,
+        gaps_plot,
+        marker="o",
+        linewidth=2,
+        color="black",
+        label="gap: pos - random neg",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Mean sigmoid positive - mean sigmoid random negative")
+    plt.title("Gap between positive pairs and random negative pairs")
+    plt.grid(True, alpha=0.3)
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    plt.legend(unique.values(), unique.keys(), loc="best")
+
+    plt.tight_layout()
+
+    gap_plot_path = os.path.join(
+        attention_plot_dir,
+        "gap_pos_vs_random_neg.png",
+    )
+
+    plt.savefig(gap_plot_path, dpi=200)
+    plt.close()
+
+    print("Saved gap plot:", gap_plot_path)
+
+    # Also save a second plot showing the two sigmoid means separately.
+    plt.figure(figsize=(12, 6))
+
+    for start_epoch, end_epoch, frac, color in phases:
+        if start_epoch <= max_epoch:
+            plt.axvspan(
+                start_epoch - 0.5,
+                min(end_epoch, max_epoch) + 0.5,
+                color=color,
+                alpha=0.22,
+                label=f"hard neg frac = {frac}",
+            )
+
+    plt.plot(
+        epochs_plot,
+        pos_plot,
+        marker="o",
+        linewidth=2,
+        color="black",
+        label="mean sigmoid positives",
+    )
+
+    plt.plot(
+        epochs_plot,
+        rand_neg_plot,
+        marker="s",
+        linewidth=2,
+        color="red",
+        label="mean sigmoid random negatives",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Mean sigmoid score")
+    plt.title("Positive vs random negative sigmoid scores")
+    plt.grid(True, alpha=0.3)
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    plt.legend(unique.values(), unique.keys(), loc="best")
+
+    plt.tight_layout()
+
+    means_plot_path = os.path.join(
+        attention_plot_dir,
+        "mean_sigmoid_pos_vs_random_neg.png",
+    )
+
+    plt.savefig(means_plot_path, dpi=200)
+    plt.close()
+
+    print("Saved sigmoid means plot:", means_plot_path)
+
+
+
+def save_loss_plot(epoch_history, attention_plot_dir):
+    if len(epoch_history) == 0:
+        return
+
+    epochs_plot = [row["epoch"] for row in epoch_history]
+    losses_plot = [row["average_loss"] for row in epoch_history]
+
+    max_epoch = max(epochs_plot)
+
+    plt.figure(figsize=(12, 6))
+
+    phases = [
+        (1, 3, 0.0, "#e0e0e0"),    # gray
+        (4, 10, 0.1, "#1f78b4"),   # blue
+        (11, 20, 0.2, "#33a02c"),  # green
+        (21, 30, 0.3, "#ff7f00"),  # orange
+        (31, 40, 0.4, "#e31a1c"),  # red
+        (41, 50, 0.5, "#6a3d9a"),  # purple
+    ]
+
+    for start_epoch, end_epoch, frac, color in phases:
+        if start_epoch <= max_epoch:
+            plt.axvspan(
+                start_epoch - 0.5,
+                min(end_epoch, max_epoch) + 0.5,
+                color=color,
+                alpha=0.22,
+                label=f"hard neg frac = {frac}",
+            )
+
+    plt.plot(
+        epochs_plot,
+        losses_plot,
+        marker="o",
+        linewidth=2,
+        color="black",
+        label="average loss",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Average loss")
+    plt.title("Average loss with hard-negative curriculum")
+    plt.grid(True, alpha=0.3)
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    plt.legend(unique.values(), unique.keys(), loc="best")
+
+    plt.tight_layout()
+
+    loss_plot_path = os.path.join(
+        attention_plot_dir,
+        "average_loss_curriculum.png",
+    )
+
+    plt.savefig(loss_plot_path, dpi=200)
+    plt.close()
+
+    print("Saved loss plot:", loss_plot_path)
+
+
+def save_pair_confusion_matrix(
     model,
     dataset,
     cfg,
-    file_idx,
-    event_idx,
     output_dir,
-    max_plot_hits=500,
+    max_positive_pairs=2000,
+    threshold=0.5,
+    max_events=100,
 ):
+    """
+    Saves a binary confusion matrix for pair classification.
+
+    Class 1 = positive pair:
+        two hits from the same particle
+
+    Class 0 = random negative pair:
+        two hits from different particles
+
+    Prediction:
+        sigmoid(attention_score) >= threshold
+    """
+
     os.makedirs(output_dir, exist_ok=True)
 
     model.eval()
 
-    file_data = dataset.get_file(file_idx)
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
 
-    hits_tensor = file_data["hits_tensor"]
-    padding_mask = file_data["padding_mask"]
-
-    batched_hits_cpu = hits_tensor[event_idx]
-    batched_mask_cpu = padding_mask[event_idx]
-
-    batched_hits = batched_hits_cpu.to(cfg.device_acc, dtype=model.dtype)
-    batched_mask = batched_mask_cpu.to(cfg.device_acc)
+    used_events = 0
 
     with torch.no_grad():
-        _, attention_weights = model(
-            batched_hits,
-            batched_mask,
-        )
+        num_files = len(dataset.file_paths)
 
-    attention_map = attention_weights
+        for file_idx in range(num_files):
+            if used_events >= max_events:
+                break
 
-    if attention_map.dim() == 3:
-        attention_map = attention_map[0]
+            print()
+            print("=" * 80)
+            print(f"Confusion matrix evaluation: loading file {file_idx + 1}/{num_files}")
+            print("=" * 80)
 
-    attention_map = torch.sigmoid(attention_map.detach().cpu())
+            file_data = dataset.get_file(file_idx)
 
-    padding_mask_cpu = batched_mask_cpu.detach().cpu()
-    real_hit_mask = ~padding_mask_cpu[0]
+            hits_tensor = file_data["hits_tensor"]
+            padding_mask = file_data["padding_mask"]
+            hit_to_particle_tensor = file_data["hit_to_particle_tensor"]
 
-    real_indices = torch.nonzero(
-        real_hit_mask,
-        as_tuple=False,
-    ).squeeze(-1)
+            n_events = hits_tensor.shape[0]
 
-    real_indices = real_indices[:max_plot_hits]
+            for event_idx in range(n_events):
+                if used_events >= max_events:
+                    break
 
-    attention_to_plot = attention_map[real_indices][:, real_indices]
+                batched_hits_cpu = hits_tensor[event_idx]
+                batched_mask_cpu = padding_mask[event_idx]
+                particle_ids_cpu = hit_to_particle_tensor[event_idx, 0]
+
+                pairs1, pairs2, target = sample_positive_pairs_from_particle_ids(
+                    particle_ids_cpu,
+                    max_positive_pairs=max_positive_pairs,
+                )
+
+                if pairs1.numel() == 0:
+                    continue
+
+                batched_hits = batched_hits_cpu.to(
+                    cfg.device_acc,
+                    dtype=model.dtype,
+                )
+
+                batched_mask = batched_mask_cpu.to(cfg.device_acc)
+
+                pairs1 = pairs1.to(cfg.device_acc).long()
+                pairs2 = pairs2.to(cfg.device_acc).long()
+                target = target.to(cfg.device_acc).float()
+                particle_ids = particle_ids_cpu.to(cfg.device_acc).long()
+
+                _, attention_weights = model(
+                    batched_hits,
+                    batched_mask,
+                )
+
+                attention_map = attention_weights
+
+                if attention_map.dim() == 3:
+                    attention_map = attention_map[0]
+
+                # hard_negative_fraction=0.0 means we evaluate against random negatives only
+                loss, loss_debug = top_attention_loss(
+                    attention_map,
+                    pairs1,
+                    pairs2,
+                    target,
+                    particle_ids,
+                    batched_mask,
+                    return_debug=True,
+                    hard_negative_fraction=0.0,
+                )
+
+                positive_scores = loss_debug["positive_scores"]
+                random_negative_scores = loss_debug["random_negative_scores"]
+
+                if positive_scores.numel() == 0:
+                    continue
+
+                if random_negative_scores.numel() == 0:
+                    continue
+
+                positive_probs = torch.sigmoid(positive_scores)
+                negative_probs = torch.sigmoid(random_negative_scores)
+
+                positive_pred = positive_probs >= threshold
+                negative_pred = negative_probs >= threshold
+
+             
+                tp += positive_pred.sum().item()
+
+                fn += (~positive_pred).sum().item()
+                
+                fp += negative_pred.sum().item()
+                
+                tn += (~negative_pred).sum().item()
+
+                used_events += 1
+
+                if used_events % 10 == 0:
+                    print(f"Evaluated events: {used_events}/{max_events}")
+
+            del file_data
+            del hits_tensor
+            del padding_mask
+            del hit_to_particle_tensor
+
+            if cfg.device_acc.type == "cuda":
+                torch.cuda.empty_cache()
+
+    total = tp + tn + fp + fn
+
+    if total == 0:
+        print("No pairs found for confusion matrix.")
+        return
+
+    accuracy = (tp + tn) / total
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+
+    print()
+    print("=" * 80)
+    print("Pair confusion matrix")
+    print("threshold:", threshold)
+    print("evaluated events:", used_events)
+    print("TN:", tn)
+    print("FP:", fp)
+    print("FN:", fn)
+    print("TP:", tp)
+    print("accuracy:", accuracy)
+    print("precision:", precision)
+    print("recall:", recall)
+    print("f1:", f1)
+    print("=" * 80)
+
+    matrix = [
+        [tn, fp],
+        [fn, tp],
+    ]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    im = ax.imshow(matrix)
+
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+
+    ax.set_xticklabels(["Predicted negative", "Predicted positive"])
+    ax.set_yticklabels(["True negative", "True positive"])
+
+    ax.set_title(
+        f"Pair confusion matrix\n"
+        f"threshold={threshold}, accuracy={accuracy:.3f}, F1={f1:.3f}"
+    )
+
+    for i in range(2):
+        for j in range(2):
+            ax.text(
+                j,
+                i,
+                str(matrix[i][j]),
+                ha="center",
+                va="center",
+                fontsize=14,
+            )
+
+    fig.colorbar(im, ax=ax)
+
+    plt.tight_layout()
 
     output_path = os.path.join(
         output_dir,
-        (
-            f"final_attention_heatmap"
-            f"_file{file_idx}"
-            f"_event{event_idx}"
-            f"_real_first{len(real_indices)}.png"
-        ),
+        "pair_confusion_matrix_random_negatives.png",
     )
 
-    plt.figure(figsize=(8, 7))
-    im = plt.imshow(
-        attention_to_plot.numpy(),
-        aspect="auto",
-    )
-
-    cbar = plt.colorbar(im, label="sigmoid(attention score)")
-    cbar.formatter = ticker.FormatStrFormatter("%.6f")
-    cbar.update_ticks()
-
-    plt.title(
-        (
-            f"Final attention heatmap | file {file_idx}, "
-            f"event {event_idx} | first {len(real_indices)} real hits"
-        )
-    )
-    plt.xlabel("Hit index")
-    plt.ylabel("Hit index")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=200)
     plt.close()
 
-    print("Saved final attention heatmap:", output_path)
+    print("Saved confusion matrix:", output_path)
 
-    del file_data
-    del hits_tensor
-    del padding_mask
+    metrics_path = os.path.join(
+        output_dir,
+        "pair_confusion_matrix_metrics.txt",
+    )
 
-    if cfg.device_acc.type == "cuda":
-        torch.cuda.empty_cache()
+    with open(metrics_path, "w") as f:
+        f.write(f"threshold: {threshold}\n")
+        f.write(f"evaluated_events: {used_events}\n")
+        f.write(f"TN: {tn}\n")
+        f.write(f"FP: {fp}\n")
+        f.write(f"FN: {fn}\n")
+        f.write(f"TP: {tp}\n")
+        f.write(f"accuracy: {accuracy}\n")
+        f.write(f"precision: {precision}\n")
+        f.write(f"recall: {recall}\n")
+        f.write(f"f1: {f1}\n")
 
-
-def print_attention_debug(attention_map, batched_mask, pairs1, pairs2):
-    print("raw attention logits stats on real-hit square:")
-
-    real_hit_mask = ~batched_mask[0]
-    real_attention = attention_map[real_hit_mask][:, real_hit_mask]
-
-    finite_mask = torch.isfinite(real_attention)
-    finite_scores = real_attention[finite_mask]
-
-    print("  real hits:", real_hit_mask.sum().item())
-    print("  finite entries:", finite_scores.numel())
-
-    if finite_scores.numel() > 0:
-        print("  min:", finite_scores.detach().min().item())
-        print("  max:", finite_scores.detach().max().item())
-        print("  mean:", finite_scores.detach().mean().item())
-        print("  std:", finite_scores.detach().std().item())
-
-        sig = torch.sigmoid(finite_scores.detach())
-        print("sigmoid attention stats on real-hit square:")
-        print("  min:", sig.min().item())
-        print("  max:", sig.max().item())
-        print("  mean:", sig.mean().item())
-        print("  std:", sig.std().item())
-
-    pos_debug_scores = attention_map[pairs1, pairs2]
-    pos_debug_scores = pos_debug_scores[torch.isfinite(pos_debug_scores)]
-
-    print("positive pair logits stats:")
-    print("  positive entries:", pos_debug_scores.numel())
-
-    if pos_debug_scores.numel() > 0:
-        print("  min:", pos_debug_scores.detach().min().item())
-        print("  max:", pos_debug_scores.detach().max().item())
-        print("  mean:", pos_debug_scores.detach().mean().item())
-        print("  std:", pos_debug_scores.detach().std().item())
-
-        pos_sig = torch.sigmoid(pos_debug_scores.detach())
-        print("positive pair sigmoid stats:")
-        print("  min:", pos_sig.min().item())
-        print("  max:", pos_sig.max().item())
-        print("  mean:", pos_sig.mean().item())
-        print("  std:", pos_sig.std().item())
+    print("Saved confusion matrix metrics:", metrics_path)
 
 
-def print_loss_debug(loss_debug):
-    if loss_debug is None:
-        return
 
-    positive_scores = loss_debug["positive_scores"]
-    negative_scores = loss_debug["negative_scores"]
+def top_attention_loss(
+    attention_map_bin: torch.Tensor,
+    pairs1: torch.Tensor,
+    pairs2: torch.Tensor,
+    target: torch.Tensor,
+    particle_ids: torch.Tensor,
+    padding_mask: torch.Tensor,
+    return_debug: bool = False,
+    hard_negative_fraction: float = 0.2,
+) -> torch.Tensor:
+    """
+    Attention loss using BCE-with-logits.
 
-    positive_scores = positive_scores[torch.isfinite(positive_scores)]
-    negative_scores = negative_scores[torch.isfinite(negative_scores)]
+    Positives:
+        sampled same-particle pairs given by pairs1, pairs2, target > 0.
 
-    print("loss-selected score stats:")
-    print("  positive entries:", positive_scores.numel())
+    Negatives:
+        pairs of real hits whose particle IDs are different.
 
-    if positive_scores.numel() > 0:
-        print("  positive logits min:", positive_scores.min().item())
-        print("  positive logits max:", positive_scores.max().item())
-        print("  positive logits mean:", positive_scores.mean().item())
-        print("  positive logits std:", positive_scores.std().item())
+    """
 
-        positive_sigmoid = torch.sigmoid(positive_scores)
-        print("  positive sigmoid mean:", positive_sigmoid.mean().item())
-        print("  positive sigmoid std:", positive_sigmoid.std().item())
+    device = attention_map_bin.device
+    dtype = attention_map_bin.dtype
 
-    print("  negative entries:", negative_scores.numel())
+    if attention_map_bin.dim() == 3:
+        attention_map_bin = attention_map_bin[0]
 
-    if negative_scores.numel() > 0:
-        print("  negative logits min:", negative_scores.min().item())
-        print("  negative logits max:", negative_scores.max().item())
-        print("  negative logits mean:", negative_scores.mean().item())
-        print("  negative logits std:", negative_scores.std().item())
+    seq_len = attention_map_bin.shape[0]
 
-        negative_sigmoid = torch.sigmoid(negative_scores)
-        print("  negative sigmoid mean:", negative_sigmoid.mean().item())
-        print("  negative sigmoid std:", negative_sigmoid.std().item())
+    particle_ids = particle_ids.to(device)
 
-    if positive_scores.numel() > 0 and negative_scores.numel() > 0:
-        print(
-            "  sigmoid gap positive-minus-negative:",
-            torch.sigmoid(positive_scores).mean().item()
-            - torch.sigmoid(negative_scores).mean().item(),
+    if particle_ids.dim() == 3:
+        particle_ids = particle_ids[0, :, 0]
+    elif particle_ids.dim() == 2:
+        particle_ids = particle_ids[:, 0]
+    else:
+        particle_ids = particle_ids.view(-1)
+
+    particle_ids = particle_ids.long()
+
+    padding_mask = padding_mask.to(device)
+
+    if padding_mask.dim() == 2:
+        padding_mask = padding_mask[0]
+    else:
+        padding_mask = padding_mask.view(-1)
+
+    padding_mask = padding_mask.bool()
+
+    real_hit_mask = ~padding_mask
+
+    real_hit_mask = real_hit_mask[:seq_len]
+    particle_ids = particle_ids[:seq_len]
+
+    pos_mask = target > 0
+
+    if not torch.any(pos_mask):
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+        if return_debug:
+            debug_info = {
+                "positive_scores": torch.empty(0, device=device, dtype=dtype),
+                "negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "num_positive_pairs": torch.tensor(0, device=device),
+                "num_negative_candidates": torch.tensor(0, device=device),
+                "num_selected_negatives": torch.tensor(0, device=device),
+            }
+            return loss, debug_info
+
+        return loss
+
+    pos_i = pairs1[pos_mask].long().to(device)
+    pos_j = pairs2[pos_mask].long().to(device)
+
+    pair_weights_pos = target[pos_mask].abs().float().to(device)
+
+    valid_pos = (
+        (pos_i >= 0)
+        & (pos_i < seq_len)
+        & (pos_j >= 0)
+        & (pos_j < seq_len)
+    )
+
+    valid_pos = valid_pos & real_hit_mask[pos_i] & real_hit_mask[pos_j]
+    valid_pos = valid_pos & torch.isfinite(attention_map_bin[pos_i, pos_j])
+
+    pos_i = pos_i[valid_pos]
+    pos_j = pos_j[valid_pos]
+    pair_weights_pos = pair_weights_pos[valid_pos]
+
+    if pos_i.numel() == 0:
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+        if return_debug:
+            debug_info = {
+                "positive_scores": torch.empty(0, device=device, dtype=dtype),
+                "negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "num_positive_pairs": torch.tensor(0, device=device),
+                "num_negative_candidates": torch.tensor(0, device=device),
+                "num_selected_negatives": torch.tensor(0, device=device),
+            }
+            return loss, debug_info
+
+        return loss
+
+    pos_scores = attention_map_bin[pos_i, pos_j]
+    num_pos = pos_scores.numel()
+
+    valid_pair_mask = real_hit_mask[:, None] & real_hit_mask[None, :]
+    same_particle_mask = particle_ids[:, None] == particle_ids[None, :]
+
+    eye = torch.eye(seq_len, dtype=torch.bool, device=device)
+
+    neg_mask = (
+        valid_pair_mask
+        & (~same_particle_mask)
+        & (~eye)
+        & torch.isfinite(attention_map_bin)
+    )
+
+    neg_scores = attention_map_bin[neg_mask]
+
+    total_num_neg = min(num_pos, neg_scores.numel())
+
+    if total_num_neg == 0:
+        random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+        hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
+        mixed_neg_scores = torch.empty(0, device=device, dtype=dtype)
+
+    else:
+        hard_negative_fraction = max(
+            0.0,
+            min(1.0, float(hard_negative_fraction)),
         )
 
+        num_hard = int(total_num_neg * hard_negative_fraction)
+        num_random = total_num_neg - num_hard
 
-def print_gradient_debug(model):
-    print("Gradient check:")
+        if num_hard > 0:
+            hard_neg_scores, hard_indices = torch.topk(
+                neg_scores,
+                k=num_hard,
+                largest=True,
+                sorted=False,
+            )
+        else:
+            hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
+            hard_indices = torch.empty(0, device=device, dtype=torch.long)
 
-    for name, param in model.named_parameters():
-        if "attention" in name.lower() or "matching" in name.lower():
-            if param.grad is None:
-                print(name, "grad: None")
+        if num_random > 0:
+            remaining_mask = torch.ones(
+                neg_scores.numel(),
+                dtype=torch.bool,
+                device=device,
+            )
+
+            if hard_indices.numel() > 0:
+                remaining_mask[hard_indices] = False
+
+            remaining_scores = neg_scores[remaining_mask]
+
+            if remaining_scores.numel() == 0:
+                random_neg_scores = torch.empty(0, device=device, dtype=dtype)
             else:
-                print(name, "grad norm:", param.grad.detach().norm().item())
+                actual_num_random = min(
+                    num_random,
+                    remaining_scores.numel(),
+                )
+
+                random_indices = torch.randperm(
+                    remaining_scores.numel(),
+                    device=device,
+                )[:actual_num_random]
+
+                random_neg_scores = remaining_scores[random_indices]
+
+        else:
+            random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+
+        mixed_neg_scores = torch.cat(
+            [
+                random_neg_scores,
+                hard_neg_scores,
+            ],
+            dim=0,
+        )
+
+    logits = torch.cat(
+        [
+            pos_scores,
+            mixed_neg_scores,
+        ],
+        dim=0,
+    )
+
+    targets = torch.cat(
+        [
+            torch.ones(num_pos, device=device, dtype=dtype),
+            torch.zeros(mixed_neg_scores.numel(), device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+
+    pos_weight = 1.0 / max(num_pos, 1)
+    neg_weight = 1.0 / max(mixed_neg_scores.numel(), 1)
+
+    pos_weights = pos_weight * pair_weights_pos.to(dtype)
+
+    neg_weights = torch.full(
+        (mixed_neg_scores.numel(),),
+        neg_weight,
+        device=device,
+        dtype=dtype,
+    )
+
+    weights = torch.cat(
+        [
+            pos_weights,
+            neg_weights,
+        ],
+        dim=0,
+    )
+
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        weight=weights,
+        reduction="sum",
+    )
+
+    if return_debug:
+        debug_info = {
+            "positive_scores": pos_scores.detach(),
+            "negative_scores": mixed_neg_scores.detach(),
+            "random_negative_scores": random_neg_scores.detach(),
+            "hard_negative_scores": hard_neg_scores.detach(),
+            "num_positive_pairs": torch.tensor(num_pos, device=device),
+            "num_negative_candidates": torch.tensor(
+                neg_scores.numel(),
+                device=device,
+            ),
+            "num_selected_negatives": torch.tensor(
+                mixed_neg_scores.numel(),
+                device=device,
+            ),
+        }
+        return loss, debug_info
+
+    return loss
 
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=40,
+        help="Number of training epochs. Use 30 or 40 for your comparison.",
+    )
+
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Optional name used in checkpoint and plot directories.",
+    )
+
+    args = parser.parse_args()
+
     cfg = SeedConfig()
 
     cfg.device_acc = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -243,15 +775,20 @@ def main():
     cfg.dropout = 0.1
     cfg.regression = False
 
-    num_epochs = 50
+    num_epochs = args.num_epochs
     max_positive_pairs = 2000
     learning_rate = 1e-3
     weight_decay = 1e-2
 
     print_every = 50
 
-    checkpoint_dir = "/gpfs/workdir/thibauts/dune_training_checkpoints_E10_P2000_lr1e-3_curriculum"
-    attention_plot_dir = "/gpfs/workdir/thibauts/attention_plots_E10_P2000_lr1e-3_curriculum"
+    if args.run_name is None:
+        run_name = f"E{num_epochs}_P{max_positive_pairs}_lr1e-3_curriculum_gap"
+    else:
+        run_name = args.run_name
+
+    checkpoint_dir = f"/gpfs/workdir/thibauts/dune_training_checkpoints_{run_name}"
+    attention_plot_dir = f"/gpfs/workdir/thibauts/attention_plots_{run_name}"
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(attention_plot_dir, exist_ok=True)
@@ -316,6 +853,7 @@ def main():
     print("  epochs 41-50: hard_negative_fraction = 0.5")
 
     global_step = 0
+    epoch_history = []
 
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
@@ -336,6 +874,12 @@ def main():
         successful_events = 0
         skipped_events = 0
 
+        epoch_pos_sigmoid_sum = 0.0
+        epoch_pos_count = 0
+
+        epoch_random_neg_sigmoid_sum = 0.0
+        epoch_random_neg_count = 0
+
         for file_idx in range(num_files):
             print()
             print("#" * 80)
@@ -351,7 +895,11 @@ def main():
             print("Loaded file on CPU:")
             print("hits_tensor:", hits_tensor.shape, hits_tensor.device)
             print("padding_mask:", padding_mask.shape, padding_mask.device)
-            print("hit_to_particle_tensor:", hit_to_particle_tensor.shape, hit_to_particle_tensor.device)
+            print(
+                "hit_to_particle_tensor:",
+                hit_to_particle_tensor.shape,
+                hit_to_particle_tensor.device,
+            )
 
             n_events = hits_tensor.shape[0]
 
@@ -400,28 +948,16 @@ def main():
                         pairs2=pairs2,
                     )
 
-                if global_step % 100 == 0:
-                    loss, loss_debug = top_attention_loss(
-                        attention_map,
-                        pairs1,
-                        pairs2,
-                        target,
-                        particle_ids,
-                        batched_mask,
-                        return_debug=True,
-                        hard_negative_fraction=hard_negative_fraction,
-                    )
-                else:
-                    loss = top_attention_loss(
-                        attention_map,
-                        pairs1,
-                        pairs2,
-                        target,
-                        particle_ids,
-                        batched_mask,
-                        hard_negative_fraction=hard_negative_fraction,
-                    )
-                    loss_debug = None
+                loss, loss_debug = top_attention_loss(
+                    attention_map,
+                    pairs1,
+                    pairs2,
+                    target,
+                    particle_ids,
+                    batched_mask,
+                    return_debug=True,
+                    hard_negative_fraction=hard_negative_fraction,
+                )
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(
@@ -429,9 +965,23 @@ def main():
                         f"file_idx={file_idx}, event_idx={event_idx}: {loss.item()}"
                     )
 
-                if loss_debug is not None:
+                if global_step % 100 == 0:
                     print("hard_negative_fraction:", hard_negative_fraction)
                     print_loss_debug(loss_debug)
+
+                with torch.no_grad():
+                    positive_scores = loss_debug["positive_scores"]
+                    random_negative_scores = loss_debug["random_negative_scores"]
+
+                    if positive_scores.numel() > 0:
+                        positive_sigmoid = torch.sigmoid(positive_scores)
+                        epoch_pos_sigmoid_sum += positive_sigmoid.sum().item()
+                        epoch_pos_count += positive_sigmoid.numel()
+
+                    if random_negative_scores.numel() > 0:
+                        random_negative_sigmoid = torch.sigmoid(random_negative_scores)
+                        epoch_random_neg_sigmoid_sum += random_negative_sigmoid.sum().item()
+                        epoch_random_neg_count += random_negative_sigmoid.numel()
 
                 loss.backward()
 
@@ -459,6 +1009,18 @@ def main():
                     print("sampled positive pairs:", pairs1.numel())
                     print("loss:", loss_value)
 
+                    if positive_scores.numel() > 0:
+                        print(
+                            "batch mean sigmoid positives:",
+                            torch.sigmoid(positive_scores).mean().item(),
+                        )
+
+                    if random_negative_scores.numel() > 0:
+                        print(
+                            "batch mean sigmoid random negatives:",
+                            torch.sigmoid(random_negative_scores).mean().item(),
+                        )
+
                     if cfg.device_acc.type == "cuda":
                         print(
                             "current memory GB:",
@@ -482,6 +1044,20 @@ def main():
         else:
             avg_loss = float("nan")
 
+        if epoch_pos_count > 0:
+            mean_pos_sigmoid = epoch_pos_sigmoid_sum / epoch_pos_count
+        else:
+            mean_pos_sigmoid = float("nan")
+
+        if epoch_random_neg_count > 0:
+            mean_random_neg_sigmoid = (
+                epoch_random_neg_sigmoid_sum / epoch_random_neg_count
+            )
+        else:
+            mean_random_neg_sigmoid = float("nan")
+
+        gap_pos_random_neg = mean_pos_sigmoid - mean_random_neg_sigmoid
+
         print()
         print("=" * 80)
         print(f"Epoch {epoch + 1} summary")
@@ -489,6 +1065,9 @@ def main():
         print("successful_events:", successful_events)
         print("skipped_events:", skipped_events)
         print("average_loss:", avg_loss)
+        print("mean_pos_sigmoid:", mean_pos_sigmoid)
+        print("mean_random_neg_sigmoid:", mean_random_neg_sigmoid)
+        print("gap_pos_random_neg:", gap_pos_random_neg)
 
         if cfg.device_acc.type == "cuda":
             print(
@@ -498,6 +1077,36 @@ def main():
 
         print("=" * 80)
 
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "hard_negative_fraction": hard_negative_fraction,
+                "average_loss": avg_loss,
+                "mean_pos_sigmoid": mean_pos_sigmoid,
+                "mean_random_neg_sigmoid": mean_random_neg_sigmoid,
+                "gap_pos_random_neg": gap_pos_random_neg,
+                "successful_events": successful_events,
+                "skipped_events": skipped_events,
+            }
+        )
+
+        save_metrics_csv(
+            epoch_history=epoch_history,
+            checkpoint_dir=checkpoint_dir,
+        )
+
+        save_gap_plot(
+            epoch_history=epoch_history,
+            attention_plot_dir=attention_plot_dir,
+        )
+
+        save_loss_plot(
+            epoch_history=epoch_history,
+            attention_plot_dir=attention_plot_dir,
+        )
+        
+        
+        
         checkpoint_path = os.path.join(
             checkpoint_dir,
             f"dune_seed_transformer_epoch_{epoch + 1}.pt",
@@ -511,13 +1120,18 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
+                "mean_pos_sigmoid": mean_pos_sigmoid,
+                "mean_random_neg_sigmoid": mean_random_neg_sigmoid,
+                "gap_pos_random_neg": gap_pos_random_neg,
                 "cfg": cfg,
             },
             checkpoint_path,
         )
 
         print("Saved checkpoint:", checkpoint_path)
-
+        
+        
+    
     save_attention_heatmap(
         model=model,
         dataset=dataset,
@@ -527,9 +1141,25 @@ def main():
         output_dir=attention_plot_dir,
         max_plot_hits=500,
     )
+    
+    save_pair_confusion_matrix(
+    model=model,
+    dataset=dataset,
+    cfg=cfg,
+    output_dir=attention_plot_dir,
+    max_positive_pairs=max_positive_pairs,
+    threshold=0.5,
+    max_events=100,
+    )
 
     print()
     print("Full training finished successfully.")
+    print("Final metrics CSV:", os.path.join(checkpoint_dir, "training_gap_metrics.csv"))
+    print("Final gap plot:", os.path.join(attention_plot_dir, "gap_pos_vs_random_neg.png"))
+    print(
+        "Final sigmoid means plot:",
+        os.path.join(attention_plot_dir, "mean_sigmoid_pos_vs_random_neg.png"),
+    )
 
 
 if __name__ == "__main__":
