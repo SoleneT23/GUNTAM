@@ -940,13 +940,7 @@ def main():
                 if attention_map.dim() == 3:
                     attention_map = attention_map[0]
 
-                if global_step % 100 == 0:
-                    print_attention_debug(
-                        attention_map=attention_map,
-                        batched_mask=batched_mask,
-                        pairs1=pairs1,
-                        pairs2=pairs2,
-                    )
+        
 
                 loss, loss_debug = top_attention_loss(
                     attention_map,
@@ -967,7 +961,9 @@ def main():
 
                 if global_step % 100 == 0:
                     print("hard_negative_fraction:", hard_negative_fraction)
-                    print_loss_debug(loss_debug)
+                    print("num positive pairs:", loss_debug["num_positive_pairs"].item())
+                    print("num negative candidates:", loss_debug["num_negative_candidates"].item())
+                    print("num selected negatives:", loss_debug["num_selected_negatives"].item())
 
                 with torch.no_grad():
                     positive_scores = loss_debug["positive_scores"]
@@ -984,9 +980,6 @@ def main():
                         epoch_random_neg_count += random_negative_sigmoid.numel()
 
                 loss.backward()
-
-                if global_step % 100 == 0:
-                    print_gradient_debug(model)
 
                 optimizer.step()
 
@@ -1104,7 +1097,6 @@ def main():
             epoch_history=epoch_history,
             attention_plot_dir=attention_plot_dir,
         )
-        
         
         
         checkpoint_path = os.path.join(
