@@ -114,6 +114,10 @@ def full_attention_loss(
     return F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
 
 
+
+
+
+
 def top_attention_loss(
     attention_map_bin: torch.Tensor,
     pairs1: torch.Tensor,
@@ -133,12 +137,7 @@ def top_attention_loss(
     Negatives:
         pairs of real hits whose particle IDs are different.
 
-    Important:
-        They are defined using particle_ids:
-
-            negative pair = real hit i, real hit j, particle_id_i != particle_id_j
     """
-
 
     device = attention_map_bin.device
     dtype = attention_map_bin.dtype
@@ -184,6 +183,9 @@ def top_attention_loss(
                 "negative_scores": torch.empty(0, device=device, dtype=dtype),
                 "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
                 "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "num_positive_pairs": torch.tensor(0, device=device),
+                "num_negative_candidates": torch.tensor(0, device=device),
+                "num_selected_negatives": torch.tensor(0, device=device),
             }
             return loss, debug_info
 
@@ -217,6 +219,9 @@ def top_attention_loss(
                 "negative_scores": torch.empty(0, device=device, dtype=dtype),
                 "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
                 "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+                "num_positive_pairs": torch.tensor(0, device=device),
+                "num_negative_candidates": torch.tensor(0, device=device),
+                "num_selected_negatives": torch.tensor(0, device=device),
             }
             return loss, debug_info
 
@@ -366,6 +371,7 @@ def top_attention_loss(
         return loss, debug_info
 
     return loss
+
 
 
 def attention_next_loss(

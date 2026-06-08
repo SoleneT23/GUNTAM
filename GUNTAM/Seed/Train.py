@@ -147,7 +147,7 @@ def train_model(
 
                 with torch.set_grad_enabled(grad_enabled):
                     batched_hits = hits_tensor[event_idx].to(cfg.device_acc) # [num_bin=1, max_hit_input, num_hit_features]
-                    event_particle_ids = hit_to_particle_tensor[event_idx].to(cgf.device_acc)  # [num_bin, max_hit_input, 1]
+                    event_particle_ids = hit_to_particle_tensor[event_idx].to(cfg.device_acc)  # [num_bin, max_hit_input, 1]
                     batched_mask = padding_mask[event_idx].to(cfg.device_acc) # [num_bin, max_hit_input]
                     particle_ids_bin = event_particle_ids[0, :, 0] # [max_hit_input]
                     
