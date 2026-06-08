@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.ticker as ticker
 import matplotlib.pyplot as plt
 
 from GUNTAM.IO.DataLoader import DataLoader

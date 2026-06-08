@@ -445,7 +445,7 @@ def attention_next_loss(
             other_traj_cols[s_indices, targets[m_indices]] = True
             masked_logits[other_traj_cols] = float("-inf")
 
-        # ── Per-source weights ────────────────────────────────────────────────
+        # ── Per-source weights ──
         weights_row = pair_weights.view(1, -1).expand(unique_sources.numel(), -1)  # [S, M]
         source_weights = torch.max(torch.where(source_eq, weights_row, torch.zeros_like(weights_row)), dim=1).values  # [S]
 
