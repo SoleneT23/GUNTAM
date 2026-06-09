@@ -45,7 +45,8 @@ class PreprocessingConfig:
         # Processing parameters
         self.events_per_file = 220 # Maximum number of events per output tensor file
         self.max_events = -1  # Maximum number of events to process (-1 for all events)
-
+        self.csv_chunksize = 1_000_000 # Number of csv rows read at once prepare_tensor()
+        
         # Orphan hit removal
         self.orphan_hit_fraction = 0.0  # Fraction of orphan hits to remove (0.0 to 1.0)
 
@@ -55,14 +56,13 @@ class PreprocessingConfig:
         self.binning_margin = 0.01  # Margin for margin binning strategy (fraction of bin_width)
         self.max_hit_input = 5000  # Maximum number of hits per bin (p90: 4373, p95: 4945)
 
-
         # Selection parameters
         self.eta_range = [-3.0, 3.0]  # Eta range for particle selection [min, max]
         self.vertex_cuts = [10, 200]  # Cuts on d0 and z0 for primary vertex selection
         self.hit_range = [500, 1000]  # Cuts on R and Z for hit selection [R_max, Z_max]
 
         # Feature lists
-        self.hit_features = ["x", "y", "z"]  # List of hit features to extract
+        self.hit_features = ["x", "y", "z", "charge"]  # List of hit features to extract
         self.particle_features = ["eta", "phi", "pT"]  # List of particle features to extract
 
         # Event weights
@@ -72,6 +72,7 @@ class PreprocessingConfig:
         self.num_workers = 1  # Number of parallel worker processes for batch processing. 
 
         self.random_state = 1993
+        
         
     def add_args(self, parser: argparse.ArgumentParser) -> None:
         """
@@ -124,6 +125,13 @@ class PreprocessingConfig:
             type=int,
             default=self.max_events,
             help="Maximum number of events to process (-1 for all events)",
+        )
+
+        parser.add_argument(
+            "--csv_chunksize",
+            type=int,
+            default=self.csv_chunksize,
+            help="Number of csv rows to read at once when processing the larger csv file"
         )
 
         # Orphan hit removal
@@ -227,6 +235,7 @@ class PreprocessingConfig:
 
         self.events_per_file = args.events_per_file
         self.max_events = args.max_events
+        self.csv_chunksize = args.csv_chunksize
 
         self.orphan_hit_fraction = args.orphan_hit_fraction
 
@@ -338,6 +347,8 @@ class PreprocessingConfig:
         print("\nProcessing:")
         print("  Events per file: ", self.events_per_file)
         print("  Max events: ", self.max_events)
+        print("  CSV chunksize: ", self.csv_chunksize)
+
 
         print("\nOrphan Hit Removal:")
         print("  Orphan hit fraction: ", self.orphan_hit_fraction)

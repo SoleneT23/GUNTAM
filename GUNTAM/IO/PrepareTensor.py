@@ -274,7 +274,7 @@ def _to_tensor(
         
         if n_keep > 0:
             # Fill hits_tensor with hit_features
-            hit_values = event_hits[cfg.hit_features].to_numpy()[:n_keep].copy()
+            hit_values = event_hits[hit_features].to_numpy()[:n_keep].copy()
 
             hits_tensor[event_idx, 0, :n_keep, :] = torch.tensor(
                 hit_values,
@@ -384,7 +384,7 @@ def _add_padding(
     # Prepare the padding for each event
     print("    Preparing padding for events...")
     
-    max_hits = cfg.max_hit_input # p95 is ~5000 for the data, p90: 4373
+    max_hits = cfg.max_hit_input 
     data_batch = data_batch.copy()
     
     data_batch["is_padding"] = False
@@ -644,184 +644,196 @@ def compute_barcode(cfg: PreprocessingConfig) -> str:
         
     return barcode
 
-
 def prepare_tensor(
     cfg: PreprocessingConfig,
 ) -> Dict:
     """
-    Read DUNE hit files and prepare them for training by converting to PyTorch tensors.
+    Read one large DUNE CSV file directly by chunks and prepare tensors for training.
 
-    This function performs the complete data preprocessing pipeline:
-    - load hit data from CSV or HDF5 files
-    - optionally remove a fraction of orphan hits (hits with no associated particle) via _process_single_batch() function
-    - pad or truncate each event to cfg.max_hit_input hits
-    - creating a padding mask for attention mechanisms
-    - save hit_to_particle_tensor so positive pairs can be sampled during training 
-    - convert all data to PyTorch tensors
-    - save one tensor file per batch of events
+    Pipeline:
+    - read the big CSV by chunks
+    - keep the last event of each chunk in a buffer, because it may be incomplete
+    - process only complete events
+    - group complete events into batches of cfg.events_per_file
+    - pad/truncate each event to cfg.max_hit_input
+    - create hits_tensor, hit_to_particle_tensor, padding_mask
+    - save one tensor_data file per batch of events
 
-    For each batch of events, a single data file is saved to disk in either PyTorch (.pt) or
-    compressed HDF5 (.h5) format containing:
-    - `hits_tensor`: Hit data with shape [num_events, num_bins=1, max_hit_input, num_hit_features]
-    - `hit_to_particle_tensor`: Hit-to-particle mapping with shape [num_events, num_bins=1, max_hit_input, 1]
-    - `padding_mask`: Padding mask with shape [num_events, num_bins=1, max_hit_input]
-    - Metadata: start_event, end_event, nb_bins=1, batch_events
+    Expected input CSV columns:
+        event_id, particle_id, x, y, z, charge
 
-    A metadata file is also created containing information about the dataset structure and file paths.
-    The output format (PyTorch or HDF5) is controlled by cfg.tensor_format.
-
-    Args:
-        cfg: Configuration object containing all parameters including:
-            - input_path: Path to input data files
-            - input_format: Format of input files ('csv' or 'h5')
-            - input_tensor_path: Path where output tensors will be saved
-            - events_per_file: Maximum number of events per output tensor file
-            - orphan_hit_fraction: Fraction of orphan hits to remove
-            - binning_strategy: Binning strategy to use ('global', 'neighbor', 'margin', 'no_bin')
-            - bin_width: Width of bins for binning
-            - max_hit_input: Maximum number of hits per bin
-            - hit_features: List of column names to use as hit features
-            - tensor_format: Output tensor file format ('pt' for PyTorch or 'h5' for compressed HDF5)
-
-    Returns:
-        Dictionary containing metadata about the processed dataset including:
-        - total_events: Total number of events processed
-        - events_per_file: Number of events per output file 
-        - nb_bins: Maximum number of bins used, here 1 
-        - orphan_hit_fraction: Fraction of orphan hits removed
-        - file_paths: List of paths to generated tensor files
-        - file_event_ranges: List of (start, end) event ranges for each file
+    Important:
+        This assumes the CSV is ordered by event_id.
     """
 
-    # Use feature lists from config
+    if cfg.input_format != "csv":
+        raise ValueError(
+            "One large CSV file is expected as input. "
+            "Set cfg.input_format = 'csv'."
+        )
+
     hit_features = cfg.hit_features
-    needed_columns = list(set(["event_id", "particle_id"] + hit_features)) 
     
+    needed_columns = []
+    for col in ["event_id", "particle_id"] + hit_features:
+        if col not in needed_columns:
+            needed_columns.append(col)
+
+    required_columns = set(needed_columns)
+
+    input_file = cfg.input_path
+
+    if not os.path.isfile(input_file):
+        raise FileNotFoundError(
+            f"Expected cfg.input_path to be one CSV file, but got: {input_file}"
+        )
+        
+    chunksize = cfg.csv_chunksize # by default 1M rows per chunk
+
     total_events = 0
     nb_bins_max = 1
     file_paths: List[str] = []
     file_event_ranges: List[Tuple[int, int]] = []
+
     orphan_hit_fraction = cfg.orphan_hit_fraction
-    events_per_file = cfg.events_per_file 
+    events_per_file = cfg.events_per_file
     barcode = compute_barcode(cfg)
 
-    # Get file paths based on format
-    input_path = cfg.input_path
-    input_format = cfg.input_format
-    data_files = []
-    
-    # Collect all data files and prepare for loop
-    if input_format == "h5":
-        # Get all HDF5 files
-        data_files = sorted(glob.glob(f"{input_path}/processed_data*.h5"))
-        print(f"Found {len(data_files)} HDF5 file(s)")
-        if len(data_files) == 0:
-            raise FileNotFoundError(f"No processed_data*.h5 files found in {input_path}")
+    os.makedirs(cfg.input_tensor_path, exist_ok=True)
 
-    elif input_format == "csv":
-        data_files = sorted(glob.glob(f"{input_path}/hits_small*.csv"))
-        print(f"Found {len(data_files)} hits CSV file(s)")
-        if len(data_files) == 0:
-            raise FileNotFoundError(f"No hits_small*.csv files found in {input_path}")
-        
-    else:
-        raise ValueError(f"Unsupported input format: {input_format}. Use 'csv' or 'h5")
-    
+    print(f"Reading big CSV file: {input_file}")
+    print(f"Using chunksize={chunksize}")
+    print(f"Hit features: {hit_features}")
+    print(f"Events per tensor file: {events_per_file}")
+
+    # This buffer stores the last event of a chunk,
+    # the last event may continue in the next chunk
+    event_buffer = pd.DataFrame()
+
+    # These lists accumulate complete events until we have cfg.events_per_file events
+    current_batch_events: List[pd.DataFrame] = []
+    current_batch_event_ids: List[int] = []
+
     file_id = 0
-    tot_event = 0 
-    
-    # Processing each file
-    for file_idx, data_file in enumerate(data_files):
-        if cfg.max_events > 0 and tot_event >= cfg.max_events:
-            print(f"Reached max_events limit of {cfg.max_events}. Stopping further processing.")
+    stop_requested = False
+
+    def process_and_clear_current_batch():
+        """
+        Convert the currently accumulated events into tensors and save them.
+        """
+        nonlocal file_id
+        nonlocal total_events
+        nonlocal nb_bins_max
+        nonlocal file_paths
+        nonlocal file_event_ranges
+        nonlocal current_batch_events
+        nonlocal current_batch_event_ids
+
+        if len(current_batch_events) == 0:
+            return
+
+        data_batch = pd.concat(current_batch_events, ignore_index=True)
+
+        batch_event_ids = sorted(data_batch["event_id"].unique())
+        start_event = int(batch_event_ids[0])
+        end_event = int(batch_event_ids[-1]) + 1
+
+        args = (
+            data_batch,
+            cfg,
+            hit_features,
+            file_id,
+            barcode,
+            start_event,
+            end_event,
+        )
+
+        file_path, event_range, n_events_returned, nb_bins = _process_single_batch(args)
+
+        file_paths.append(file_path)
+        file_event_ranges.append(event_range)
+        nb_bins_max = max(nb_bins_max, nb_bins)
+
+        
+        total_events += len(batch_event_ids)
+
+        print(
+            f"Finished tensor file {file_id}: "
+            f"{len(batch_event_ids)} events, "
+            f"event IDs {start_event} to {end_event - 1}"
+        )
+
+        file_id += 1
+
+        # Reset current batch
+        current_batch_events = []
+        current_batch_event_ids = []
+
+    def add_complete_event(event_id, event_df):
+        """
+        Add one complete event to the current batch.
+        If the batch reaches cfg.events_per_file, save it.
+        """
+        nonlocal current_batch_events
+        nonlocal current_batch_event_ids
+        nonlocal stop_requested
+
+        if cfg.max_events > 0:
+            already_selected = total_events + len(current_batch_event_ids)
+            if already_selected >= cfg.max_events:
+                stop_requested = True
+                return
+
+        current_batch_events.append(event_df.reset_index(drop=True))
+        current_batch_event_ids.append(int(event_id))
+
+        if len(current_batch_events) >= events_per_file:
+            process_and_clear_current_batch()
+
+    reader = pd.read_csv(
+        input_file,
+        usecols=needed_columns,
+        chunksize=chunksize,
+    )
+
+    for chunk_idx, chunk in enumerate(reader):
+        print(f"Processing CSV chunk {chunk_idx}")
+
+        missing = required_columns - set(chunk.columns)
+        if missing:
+            raise ValueError(f"Missing columns in input CSV: {missing}")
+
+        # If the previous chunk ended with an incomplete event,
+        # add that event at the beginning of the current chunk
+        if not event_buffer.empty:
+            chunk = pd.concat([event_buffer, chunk], ignore_index=True)
+            event_buffer = pd.DataFrame()
+
+        # The last event in the current chunk may be incomplete,
+        # we keep it for the next chunk
+        last_event_id = chunk["event_id"].iloc[-1]
+
+        complete_chunk = chunk[chunk["event_id"] != last_event_id]
+        event_buffer = chunk[chunk["event_id"] == last_event_id].copy()
+
+        # Process complete events from this chunk
+        for event_id, event_df in complete_chunk.groupby("event_id", sort=True):
+            add_complete_event(event_id, event_df)
+
+            if stop_requested:
+                break
+
+        if stop_requested:
             break
 
-        print(f"Processing file {file_idx + 1}/{len(data_files)}")
+    # After the loop, the last event of the file is still in event_buffer
+    if not stop_requested and not event_buffer.empty:
+        event_id = event_buffer["event_id"].iloc[0]
+        add_complete_event(event_id, event_buffer)
 
-        if input_format == "h5":
-            # Read data from HDF5 file
-            with pd.HDFStore(data_file, mode="r") as store:
-                # Check which key exists in the HDF5 file
-                keys = [key.lstrip("/") for key in store.keys()]
+    # Save the final partial batch if it has fewer than events_per_file events
+    process_and_clear_current_batch()
 
-                if "hits" not in keys:
-                    raise KeyError(f"hits not found in {data_file}. Available keys:{store.keys()}")
-                
-                data = store.select("hits", columns=needed_columns)
-                print(f" Loaded hits data from {data_file}")
-
-        elif input_format == "csv":
-            # Read data from CSV files
-            data = pd.read_csv(data_file)
-            data = data[needed_columns].copy()
-            print(f" Loaded hits data from {data_file}")
-            
-        event_ids_all = sorted(data["event_id"].unique())  
-        num_events = len(event_ids_all)
-        tot_event += num_events
-        
-        if cfg.max_events > 0 and tot_event > cfg.max_events:
-            allowed_events = cfg.max_events + num_events - tot_event
-            print((f" Limiting to {allowed_events} event(s) from this file"))
-            event_ids_all = event_ids_all[:allowed_events]
-            data = data[data["event_id"].isin(event_ids_all)].reset_index(drop=True)
-            num_events = len(event_ids_all)
-            
-        if num_events == 0: # safety guard
-            continue
-        
-        if num_events % events_per_file != 0: # each file divided into chunks, events_per_file = number of events per chunk
-            print(f"Warning: Number of events in {data_file}({num_events})"
-                  f"is not divisible by events_per_file ({events_per_file})"
-            )
-        
-        # Build arguments for each batch so they can be processed in parallel
-        batch_args = []
-        local_file_id = file_id
-        
-        for batch_start_idx in range(0, num_events, events_per_file):
-            batch_end_idx = min(batch_start_idx + events_per_file, num_events)
-            
-            batch_event_ids = event_ids_all[batch_start_idx:batch_end_idx]
-            
-            data_batch = data[data["event_id"].isin(batch_event_ids)].reset_index(drop=True)
-
-            start_event = int(batch_event_ids[0])
-            end_event = int(batch_event_ids[-1])+1
-            
-            batch_args.append(
-                (
-                    data_batch,
-                    cfg,
-                    hit_features,
-                    local_file_id,
-                    barcode,
-                    start_event,
-                    end_event,
-                    
-                )
-            )
-            local_file_id += 1
-            
-        # Process batches
-        num_workers = min(cfg.num_workers, len(batch_args))
-        if num_workers > 1:
-            print(f" Spawning {num_workers} worker processes for {len(batch_args)} batch(es)")
-            with multiprocessing.Pool(processes=num_workers) as pool:
-                results = pool.map(_process_single_batch, batch_args)
-        else:
-            results = [_process_single_batch(args) for args in batch_args]
-        
-        # Collect results 
-        for file_path, event_range, n_events, nb_bins in results:
-            file_paths.append(file_path)
-            file_event_ranges.append(event_range)
-            total_events += n_events
-            nb_bins_max = max(nb_bins_max, nb_bins)# needed ? 
-            
-        file_id = local_file_id
-        
-        # Save metadata
     metadata = {
         "total_events": total_events,
         "events_per_file": events_per_file,
@@ -832,21 +844,29 @@ def prepare_tensor(
         "tensor_format": cfg.tensor_format,
         "file_paths": file_paths,
         "file_event_ranges": file_event_ranges,
+        "input_file": input_file,
+        "streaming_csv": True,
+        "chunksize": chunksize,
     }
-    
-    os.makedirs(cfg.input_tensor_path, exist_ok=True)
-    torch.save(metadata, f"{cfg.input_tensor_path}/metadata_{cfg.dataset_name}_{barcode}.pt")
-    
+
+    metadata_path = (
+        f"{cfg.input_tensor_path}/metadata_{cfg.dataset_name}_{barcode}.pt"
+    )
+
+    torch.save(metadata, metadata_path)
+
+    print("Done.")
+    print(f"Total events processed: {total_events}")
+    print(f"Number of tensor files written: {len(file_paths)}")
+    print(f"Metadata saved to: {metadata_path}")
+
     return metadata
 
-
 if __name__ == "__main__":
-    # Create config object and parse command line arguments
+
     cfg = PreprocessingConfig()
     cfg.parse_args()
 
-    # Print the configuration
     cfg.print_config()
 
-    # Prepare tensors using config settings
     prepare_tensor(cfg)
