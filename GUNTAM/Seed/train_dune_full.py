@@ -52,6 +52,27 @@ def add_phase_background(max_epoch):
             )
 
 
+def split_file_indices(num_files, validation_fraction):
+    if num_files < 2:
+        raise RuntimeError("Need at least 2 tensor files to create a train/validation split.")
+
+    if validation_fraction <= 0.0 or validation_fraction >= 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1.")
+
+    split_index = int(num_files * (1.0 - validation_fraction))
+
+    if split_index <= 0:
+        split_index = 1
+
+    if split_index >= num_files:
+        split_index = num_files - 1
+
+    train_file_indices = list(range(0, split_index))
+    validation_file_indices = list(range(split_index, num_files))
+
+    return train_file_indices, validation_file_indices
+
+
 def save_metrics_csv(epoch_history, checkpoint_dir):
     metrics_csv_path = os.path.join(checkpoint_dir, "training_gap_metrics.csv")
 
@@ -121,7 +142,7 @@ def save_gap_plot(epoch_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid positive - mean sigmoid random negative")
-    plt.title("Gap between positive pairs and random negative pairs")
+    plt.title("Training gap between positive pairs and random negative pairs")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -152,7 +173,7 @@ def save_gap_plot(epoch_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid score")
-    plt.title("Positive vs random negative sigmoid scores")
+    plt.title("Training positive vs random negative sigmoid scores")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -185,7 +206,7 @@ def save_loss_plot(epoch_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Average loss")
-    plt.title("Average loss with progressive introduction of hard negatives")
+    plt.title("Training average loss with progressive introduction of hard negatives")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -223,7 +244,7 @@ def save_validation_gap_plot(validation_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid positive - mean sigmoid random negative")
-    plt.title("Validation gap between positive pairs and random negative pairs")
+    plt.title("Validation gap on unseen events")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -254,7 +275,7 @@ def save_validation_gap_plot(validation_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid score")
-    plt.title("Validation positive vs random negative sigmoid scores")
+    plt.title("Validation positive vs random negative sigmoid scores on unseen events")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -290,7 +311,7 @@ def save_validation_loss_plot(validation_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Validation average loss")
-    plt.title("Validation average loss with progressive introduction of hard negatives")
+    plt.title("Validation average loss on unseen events")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -309,6 +330,7 @@ def evaluate_model_after_epoch(
     model,
     dataset,
     cfg,
+    validation_file_indices,
     hard_negative_fraction,
     max_positive_pairs,
     max_eval_events,
@@ -332,15 +354,13 @@ def evaluate_model_after_epoch(
         torch.cuda.manual_seed_all(random_seed)
 
     with torch.no_grad():
-        num_files = len(dataset.file_paths)
-
-        for file_idx in range(num_files):
+        for file_idx in validation_file_indices:
             if evaluated_events >= max_eval_events:
                 break
 
             print()
             print("=" * 80)
-            print(f"Validation: loading file {file_idx + 1}/{num_files}")
+            print(f"Validation: loading held-out file_idx={file_idx}")
             print("=" * 80)
 
             file_data = dataset.get_file(file_idx)
@@ -437,7 +457,7 @@ def evaluate_model_after_epoch(
 
     print()
     print("=" * 80)
-    print("Validation summary")
+    print("Validation summary on held-out events")
     print("hard_negative_fraction:", hard_negative_fraction)
     print("evaluated_events:", evaluated_events)
     print("skipped_events:", skipped_events)
@@ -494,6 +514,7 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--print_every", type=int, default=10)
+    parser.add_argument("--validation_fraction", type=float, default=0.2)
 
     args = parser.parse_args()
 
@@ -508,7 +529,7 @@ def main():
     print_every = args.print_every
 
     if args.run_name is None:
-        run_name = f"MH11000_charge_E{num_epochs}_P{max_positive_pairs}_lr1e-3"
+        run_name = f"MH11000_charge_E{num_epochs}_P{max_positive_pairs}_lr1e-3_true_validation"
     else:
         run_name = args.run_name
 
@@ -547,10 +568,20 @@ def main():
 
     num_files = len(dataset.file_paths)
 
+    train_file_indices, validation_file_indices = split_file_indices(
+        num_files=num_files,
+        validation_fraction=args.validation_fraction,
+    )
+
     print()
     print("Dataset:")
     print("num_files:", num_files)
     print("file_paths:", dataset.file_paths)
+    print("validation_fraction:", args.validation_fraction)
+    print("num_train_files:", len(train_file_indices))
+    print("num_validation_files:", len(validation_file_indices))
+    print("train_file_indices:", train_file_indices)
+    print("validation_file_indices:", validation_file_indices)
 
     model = SeedTransformer(cfg).to(cfg.device_acc)
     model.train()
@@ -609,13 +640,16 @@ def main():
 
         stop_epoch_early = False
 
-        for file_idx in range(num_files):
+        for file_idx in train_file_indices:
             if stop_epoch_early:
+                break
+
+            if args.max_train_events is not None and successful_events >= args.max_train_events:
                 break
 
             print()
             print("#" * 80)
-            print(f"Loading file {file_idx + 1}/{num_files}")
+            print(f"Training: loading train file_idx={file_idx}")
             print("#" * 80)
 
             file_data = dataset.get_file(file_idx)
@@ -756,7 +790,7 @@ def main():
 
         print()
         print("=" * 80)
-        print(f"Epoch {epoch + 1} summary")
+        print(f"Epoch {epoch + 1} training summary")
         print("hard_negative_fraction:", hard_negative_fraction)
         print("successful_events:", successful_events)
         print("skipped_events:", skipped_events)
@@ -787,6 +821,7 @@ def main():
             model=model,
             dataset=dataset,
             cfg=cfg,
+            validation_file_indices=validation_file_indices,
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
             max_eval_events=args.max_eval_events,
@@ -835,6 +870,8 @@ def main():
                 "validation_mean_random_neg_sigmoid": validation_metrics["validation_mean_random_neg_sigmoid"],
                 "validation_gap_pos_random_neg": validation_metrics["validation_gap_pos_random_neg"],
                 "cfg": cfg,
+                "train_file_indices": train_file_indices,
+                "validation_file_indices": validation_file_indices,
             },
             checkpoint_path,
         )
