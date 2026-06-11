@@ -13,6 +13,8 @@ top_attention_loss_keep.py
 plots.py
 sigmoid_donnees_E40.txt
 old_train_dune_full.py
+create_file_per_event.py
+test_one_event_mh11000.py
 
 .DS_Store
 
