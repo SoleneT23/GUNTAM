@@ -367,6 +367,29 @@ def save_validation_metrics_csv(validation_history, checkpoint_dir):
     print("Saved validation metrics CSV:", metrics_csv_path)
 
 
+def save_train_eval_metrics_csv(train_eval_history, checkpoint_dir):
+    metrics_csv_path = os.path.join(checkpoint_dir, "train_eval_gap_metrics.csv")
+
+    with open(metrics_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "hard_negative_fraction",
+                "train_eval_average_loss",
+                "train_eval_mean_pos_sigmoid",
+                "train_eval_mean_random_neg_sigmoid",
+                "train_eval_gap_pos_random_neg",
+                "evaluated_events",
+                "skipped_events",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(train_eval_history)
+
+    print("Saved train-set evaluation metrics CSV:", metrics_csv_path)
+
+
 def save_gap_plot(epoch_history, attention_plot_dir):
     if len(epoch_history) == 0:
         return
@@ -886,6 +909,7 @@ def main():
 
     global_step = 0
     epoch_history = []
+    train_eval_history = []
     validation_history = []
     training_debug_checks_done = 0
 
@@ -1109,6 +1133,42 @@ def main():
             }
         )
 
+        train_eval_metrics = evaluate_model_after_epoch(
+            model=model,
+            dataset=dataset,
+            cfg=cfg,
+            validation_file_indices=train_file_indices,
+            epoch=epoch,
+            hard_negative_fraction=hard_negative_fraction,
+            max_positive_pairs=max_positive_pairs,
+            max_eval_events=200,
+            random_seed=12345,
+            debug_pair_checks=False,
+            debug_pair_checks_events=0,
+        )
+
+        train_eval_history.append(
+            {
+                "epoch": epoch + 1,
+                "hard_negative_fraction": hard_negative_fraction,
+                "train_eval_average_loss": train_eval_metrics["validation_average_loss"],
+                "train_eval_mean_pos_sigmoid": train_eval_metrics["validation_mean_pos_sigmoid"],
+                "train_eval_mean_random_neg_sigmoid": train_eval_metrics["validation_mean_random_neg_sigmoid"],
+                "train_eval_gap_pos_random_neg": train_eval_metrics["validation_gap_pos_random_neg"],
+                "evaluated_events": train_eval_metrics["evaluated_events"],
+                "skipped_events": train_eval_metrics["skipped_events"],
+            }
+        )
+
+        print()
+        print("=" * 80)
+        print("Train-set evaluation summary")
+        print("train_eval_average_loss:", train_eval_metrics["validation_average_loss"])
+        print("train_eval_mean_pos_sigmoid:", train_eval_metrics["validation_mean_pos_sigmoid"])
+        print("train_eval_mean_random_neg_sigmoid:", train_eval_metrics["validation_mean_random_neg_sigmoid"])
+        print("train_eval_gap_pos_random_neg:", train_eval_metrics["validation_gap_pos_random_neg"])
+        print("=" * 80)
+
         validation_metrics = evaluate_model_after_epoch(
             model=model,
             dataset=dataset,
@@ -1140,6 +1200,8 @@ def main():
         save_gap_plot(epoch_history, attention_plot_dir)
         save_loss_plot(epoch_history, attention_plot_dir)
 
+        save_train_eval_metrics_csv(train_eval_history, checkpoint_dir)
+
         save_validation_metrics_csv(validation_history, checkpoint_dir)
         save_validation_gap_plot(validation_history, attention_plot_dir)
         save_validation_loss_plot(validation_history, attention_plot_dir)
@@ -1160,6 +1222,10 @@ def main():
                 "mean_pos_sigmoid": mean_pos_sigmoid,
                 "mean_random_neg_sigmoid": mean_random_neg_sigmoid,
                 "gap_pos_random_neg": gap_pos_random_neg,
+                "train_eval_average_loss": train_eval_metrics["validation_average_loss"],
+                "train_eval_mean_pos_sigmoid": train_eval_metrics["validation_mean_pos_sigmoid"],
+                "train_eval_mean_random_neg_sigmoid": train_eval_metrics["validation_mean_random_neg_sigmoid"],
+                "train_eval_gap_pos_random_neg": train_eval_metrics["validation_gap_pos_random_neg"],
                 "validation_average_loss": validation_metrics["validation_average_loss"],
                 "validation_mean_pos_sigmoid": validation_metrics["validation_mean_pos_sigmoid"],
                 "validation_mean_random_neg_sigmoid": validation_metrics["validation_mean_random_neg_sigmoid"],
@@ -1176,6 +1242,7 @@ def main():
     print()
     print("Full training finished successfully.")
     print("Final training metrics CSV:", os.path.join(checkpoint_dir, "training_gap_metrics.csv"))
+    print("Final train-set evaluation metrics CSV:", os.path.join(checkpoint_dir, "train_eval_gap_metrics.csv"))
     print("Final validation metrics CSV:", os.path.join(checkpoint_dir, "validation_gap_metrics.csv"))
     print("Final training gap plot:", os.path.join(attention_plot_dir, "gap_pos_vs_random_neg.png"))
     print("Final validation gap plot:", os.path.join(attention_plot_dir, "validation_gap_pos_vs_random_neg.png"))
