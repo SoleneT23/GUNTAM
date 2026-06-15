@@ -664,6 +664,7 @@ def evaluate_model_after_epoch(
                     batched_mask,
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
+                    debug_print=(global_step < 5),
                 )
 
                 if not torch.isfinite(loss):

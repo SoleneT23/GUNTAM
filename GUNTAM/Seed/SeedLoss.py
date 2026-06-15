@@ -117,7 +117,6 @@ def full_attention_loss(
 
 
 
-
 def top_attention_loss(
     attention_map_bin: torch.Tensor,
     pairs1: torch.Tensor,
@@ -127,18 +126,8 @@ def top_attention_loss(
     padding_mask: torch.Tensor,
     return_debug: bool = False,
     hard_negative_fraction: float = 0.2,
+    debug_print: bool = False,
 ) -> torch.Tensor:
-    """
-    Attention loss using BCE-with-logits.
-
-    Positives:
-        sampled same-particle pairs given by pairs1, pairs2, target > 0.
-
-    Negatives:
-        pairs of real hits whose particle IDs are different.
-
-    """
-
     device = attention_map_bin.device
     dtype = attention_map_bin.dtype
 
@@ -172,6 +161,9 @@ def top_attention_loss(
     real_hit_mask = real_hit_mask[:seq_len]
     particle_ids = particle_ids[:seq_len]
 
+    real_particle_ids = particle_ids[real_hit_mask]
+    unique_real_particle_ids = torch.unique(real_particle_ids)
+
     pos_mask = target > 0
 
     if not torch.any(pos_mask):
@@ -186,6 +178,8 @@ def top_attention_loss(
                 "num_positive_pairs": torch.tensor(0, device=device),
                 "num_negative_candidates": torch.tensor(0, device=device),
                 "num_selected_negatives": torch.tensor(0, device=device),
+                "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
+                "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
             }
             return loss, debug_info
 
@@ -222,6 +216,8 @@ def top_attention_loss(
                 "num_positive_pairs": torch.tensor(0, device=device),
                 "num_negative_candidates": torch.tensor(0, device=device),
                 "num_selected_negatives": torch.tensor(0, device=device),
+                "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
+                "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
             }
             return loss, debug_info
 
@@ -243,6 +239,47 @@ def top_attention_loss(
     )
 
     neg_scores = attention_map_bin[neg_mask]
+
+    if debug_print:
+        pos_left_ids = particle_ids[pos_i]
+        pos_right_ids = particle_ids[pos_j]
+        pos_same = pos_left_ids == pos_right_ids
+
+        print()
+        print("=" * 80)
+        print("TOP ATTENTION LOSS DEBUG")
+        print("seq_len:", seq_len)
+        print("padding_mask true count:", padding_mask.sum().item())
+        print("padding_mask false count:", (~padding_mask).sum().item())
+        print("real_hit_mask count:", real_hit_mask.sum().item())
+        print("real_particle_ids numel:", real_particle_ids.numel())
+        print("unique_real_particle_ids:", unique_real_particle_ids.numel())
+        print("unique_real_particle_ids first 20:", unique_real_particle_ids[:20].detach().cpu())
+        print("num_pos:", num_pos)
+        print("positive same-particle count:", pos_same.sum().item())
+        print("positive different-particle count:", (~pos_same).sum().item())
+        print("num_negative_candidates:", neg_scores.numel())
+
+        if num_pos > 0:
+            preview = min(10, num_pos)
+            print("first positive pairs:")
+            for k in range(preview):
+                print(
+                    int(pos_i[k].item()),
+                    int(pos_j[k].item()),
+                    int(pos_left_ids[k].item()),
+                    int(pos_right_ids[k].item()),
+                    bool(pos_same[k].item()),
+                    float(torch.sigmoid(pos_scores[k]).item()),
+                )
+
+        if neg_scores.numel() > 0:
+            print("negative score sigmoid mean:", torch.sigmoid(neg_scores).mean().item())
+            print("negative score sigmoid min:", torch.sigmoid(neg_scores).min().item())
+            print("negative score sigmoid max:", torch.sigmoid(neg_scores).max().item())
+
+        print("=" * 80)
+        print()
 
     total_num_neg = min(num_pos, neg_scores.numel())
 
@@ -359,20 +396,14 @@ def top_attention_loss(
             "random_negative_scores": random_neg_scores.detach(),
             "hard_negative_scores": hard_neg_scores.detach(),
             "num_positive_pairs": torch.tensor(num_pos, device=device),
-            "num_negative_candidates": torch.tensor(
-                neg_scores.numel(),
-                device=device,
-            ),
-            "num_selected_negatives": torch.tensor(
-                mixed_neg_scores.numel(),
-                device=device,
-            ),
+            "num_negative_candidates": torch.tensor(neg_scores.numel(), device=device),
+            "num_selected_negatives": torch.tensor(mixed_neg_scores.numel(), device=device),
+            "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
+            "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
         }
         return loss, debug_info
 
     return loss
-
-
 
 def attention_next_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
