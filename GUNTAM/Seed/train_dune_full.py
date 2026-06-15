@@ -16,17 +16,19 @@ from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
 
 def get_hard_negative_fraction(epoch):
-    if epoch < 3:
-        return 0.0
-    if epoch < 10:
-        return 0.1
-    if epoch < 20:
-        return 0.2
-    if epoch < 30:
-        return 0.3
-    if epoch < 40:
-        return 0.4
-    return 0.5
+    
+    # if epoch < 3:
+    #     return 0.0
+    # if epoch < 10:
+    #     return 0.1
+    # if epoch < 20:
+    #     return 0.2
+    # if epoch < 30:
+    #     return 0.3
+    # if epoch < 40:
+    #     return 0.4
+    # return 0.5
+    return 0.0
 
 
 def get_phases():
