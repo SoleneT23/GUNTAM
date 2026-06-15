@@ -73,6 +73,252 @@ def split_file_indices(num_files, validation_fraction):
     return train_file_indices, validation_file_indices
 
 
+def flatten_particle_ids(particle_ids):
+    if particle_ids.dim() == 3:
+        particle_ids = particle_ids[0, :, 0]
+    elif particle_ids.dim() == 2:
+        if particle_ids.shape[-1] == 1:
+            particle_ids = particle_ids[:, 0]
+        else:
+            particle_ids = particle_ids[0]
+    else:
+        particle_ids = particle_ids.view(-1)
+
+    return particle_ids.long()
+
+
+def flatten_mask(padding_mask):
+    if padding_mask.dim() == 2:
+        padding_mask = padding_mask[0]
+    else:
+        padding_mask = padding_mask.view(-1)
+
+    return padding_mask.bool()
+
+
+def tensor_stats(name, tensor):
+    if tensor is None or tensor.numel() == 0:
+        print(name, "empty")
+        return
+
+    tensor = tensor.detach().float()
+    print(
+        name,
+        "numel=",
+        tensor.numel(),
+        "min=",
+        tensor.min().item(),
+        "max=",
+        tensor.max().item(),
+        "mean=",
+        tensor.mean().item(),
+    )
+
+
+def get_debug_pair_tensors(loss_debug, possible_left_names, possible_right_names):
+    left = None
+    right = None
+
+    for name in possible_left_names:
+        if name in loss_debug:
+            left = loss_debug[name]
+            break
+
+    for name in possible_right_names:
+        if name in loss_debug:
+            right = loss_debug[name]
+            break
+
+    return left, right
+
+
+def sample_debug_random_negatives(particle_ids, valid_mask, num_pairs, device):
+    valid_indices = torch.where(valid_mask & (particle_ids >= 0))[0]
+
+    if valid_indices.numel() < 2:
+        valid_indices = torch.where(particle_ids >= 0)[0]
+
+    if valid_indices.numel() < 2:
+        return None, None
+
+    sampled_left = []
+    sampled_right = []
+    max_attempts = max(1000, num_pairs * 200)
+
+    for _ in range(max_attempts):
+        if len(sampled_left) >= num_pairs:
+            break
+
+        random_positions = torch.randint(
+            low=0,
+            high=valid_indices.numel(),
+            size=(2,),
+            device=device,
+        )
+        left = valid_indices[random_positions[0]]
+        right = valid_indices[random_positions[1]]
+
+        if left.item() == right.item():
+            continue
+
+        if particle_ids[left].item() == particle_ids[right].item():
+            continue
+
+        sampled_left.append(left)
+        sampled_right.append(right)
+
+    if len(sampled_left) == 0:
+        return None, None
+
+    return torch.stack(sampled_left), torch.stack(sampled_right)
+
+
+def print_pair_truth_debug(
+    stage,
+    epoch,
+    file_idx,
+    event_idx,
+    pairs1,
+    pairs2,
+    target,
+    particle_ids,
+    padding_mask,
+    attention_map,
+    loss_debug,
+):
+    particle_ids = flatten_particle_ids(particle_ids).to(attention_map.device)
+    valid_mask = flatten_mask(padding_mask).to(attention_map.device)
+    pairs1 = pairs1.long()
+    pairs2 = pairs2.long()
+    target = target.detach()
+
+    positive_left_ids = particle_ids[pairs1]
+    positive_right_ids = particle_ids[pairs2]
+    positive_same = positive_left_ids == positive_right_ids
+
+    print()
+    print("=" * 80)
+    print("PAIR TRUTH DEBUG")
+    print("stage:", stage)
+    print("epoch:", epoch + 1)
+    print("file_idx:", file_idx)
+    print("event_idx:", event_idx)
+    print("attention_map shape:", tuple(attention_map.shape))
+    print("particle_ids shape:", tuple(particle_ids.shape))
+    print("padding_mask shape:", tuple(valid_mask.shape))
+    print("padding_mask true count:", valid_mask.sum().item())
+    print("padding_mask false count:", (~valid_mask).sum().item())
+    print("particle_id min:", particle_ids.min().item())
+    print("particle_id max:", particle_ids.max().item())
+    print("unique particle ids:", torch.unique(particle_ids).numel())
+    print("target unique values:", torch.unique(target.detach().cpu()))
+    print("positive pair count:", pairs1.numel())
+    print("positive same-particle count:", positive_same.sum().item())
+    print("positive different-particle count:", (~positive_same).sum().item())
+
+    preview_count = min(10, pairs1.numel())
+    print("first positive pairs:")
+    for k in range(preview_count):
+        print(
+            int(pairs1[k].item()),
+            int(pairs2[k].item()),
+            int(positive_left_ids[k].item()),
+            int(positive_right_ids[k].item()),
+            bool(positive_same[k].item()),
+        )
+
+    if "positive_scores" in loss_debug:
+        direct_positive_scores = attention_map[pairs1, pairs2]
+        score_difference = (
+            direct_positive_scores.detach() - loss_debug["positive_scores"].detach()
+        ).abs()
+        tensor_stats("positive_scores", loss_debug["positive_scores"])
+        tensor_stats("direct_positive_scores", direct_positive_scores)
+        tensor_stats("abs difference positive_scores vs direct", score_difference)
+
+    if "random_negative_scores" in loss_debug:
+        tensor_stats("random_negative_scores", loss_debug["random_negative_scores"])
+
+    print("loss_debug keys:", sorted(list(loss_debug.keys())))
+
+    loss_neg_left, loss_neg_right = get_debug_pair_tensors(
+        loss_debug,
+        [
+            "random_negative_pairs1",
+            "random_neg_pairs1",
+            "random_negative_i",
+            "random_neg_i",
+            "negative_pairs1",
+            "negative_i",
+            "neg_i",
+        ],
+        [
+            "random_negative_pairs2",
+            "random_neg_pairs2",
+            "random_negative_j",
+            "random_neg_j",
+            "negative_pairs2",
+            "negative_j",
+            "neg_j",
+        ],
+    )
+
+    if loss_neg_left is not None and loss_neg_right is not None:
+        loss_neg_left = loss_neg_left.long().to(attention_map.device)
+        loss_neg_right = loss_neg_right.long().to(attention_map.device)
+        loss_neg_left_ids = particle_ids[loss_neg_left]
+        loss_neg_right_ids = particle_ids[loss_neg_right]
+        loss_neg_different = loss_neg_left_ids != loss_neg_right_ids
+
+        print("loss random negative pair count:", loss_neg_left.numel())
+        print("loss random negative different-particle count:", loss_neg_different.sum().item())
+        print("loss random negative same-particle count:", (~loss_neg_different).sum().item())
+        print("first loss random negative pairs:")
+
+        preview_count = min(10, loss_neg_left.numel())
+        for k in range(preview_count):
+            print(
+                int(loss_neg_left[k].item()),
+                int(loss_neg_right[k].item()),
+                int(loss_neg_left_ids[k].item()),
+                int(loss_neg_right_ids[k].item()),
+                bool(loss_neg_different[k].item()),
+            )
+    else:
+        print("loss random negative pair indices: not present in loss_debug")
+
+    debug_neg_left, debug_neg_right = sample_debug_random_negatives(
+        particle_ids=particle_ids,
+        valid_mask=valid_mask,
+        num_pairs=10,
+        device=attention_map.device,
+    )
+
+    if debug_neg_left is not None and debug_neg_right is not None:
+        debug_neg_left_ids = particle_ids[debug_neg_left]
+        debug_neg_right_ids = particle_ids[debug_neg_right]
+        debug_neg_scores = attention_map[debug_neg_left, debug_neg_right]
+        debug_neg_sigmoid = torch.sigmoid(debug_neg_scores)
+
+        print("independent debug negative pairs:")
+        for k in range(debug_neg_left.numel()):
+            print(
+                int(debug_neg_left[k].item()),
+                int(debug_neg_right[k].item()),
+                int(debug_neg_left_ids[k].item()),
+                int(debug_neg_right_ids[k].item()),
+                float(debug_neg_sigmoid[k].item()),
+            )
+
+        tensor_stats("independent_debug_negative_scores", debug_neg_scores)
+        tensor_stats("independent_debug_negative_sigmoid", debug_neg_sigmoid)
+    else:
+        print("independent debug negative pairs: none sampled")
+
+    print("=" * 80)
+    print()
+
+
 def save_metrics_csv(epoch_history, checkpoint_dir):
     metrics_csv_path = os.path.join(checkpoint_dir, "training_gap_metrics.csv")
 
@@ -331,10 +577,13 @@ def evaluate_model_after_epoch(
     dataset,
     cfg,
     validation_file_indices,
+    epoch,
     hard_negative_fraction,
     max_positive_pairs,
     max_eval_events,
     random_seed,
+    debug_pair_checks,
+    debug_pair_checks_events,
 ):
     model.eval()
 
@@ -347,6 +596,7 @@ def evaluate_model_after_epoch(
 
     eval_random_neg_sigmoid_sum = 0.0
     eval_random_neg_count = 0
+    debug_checks_done = 0
 
     torch.manual_seed(random_seed)
 
@@ -418,6 +668,22 @@ def evaluate_model_after_epoch(
                     raise RuntimeError(
                         f"Non-finite validation loss at file_idx={file_idx}, event_idx={event_idx}: {loss.item()}"
                     )
+
+                if debug_pair_checks and debug_checks_done < debug_pair_checks_events:
+                    print_pair_truth_debug(
+                        stage="validation",
+                        epoch=epoch,
+                        file_idx=file_idx,
+                        event_idx=event_idx,
+                        pairs1=pairs1,
+                        pairs2=pairs2,
+                        target=target,
+                        particle_ids=particle_ids,
+                        padding_mask=batched_mask,
+                        attention_map=attention_map,
+                        loss_debug=loss_debug,
+                    )
+                    debug_checks_done += 1
 
                 eval_loss_sum += loss.item()
                 evaluated_events += 1
@@ -515,6 +781,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--print_every", type=int, default=10)
     parser.add_argument("--validation_fraction", type=float, default=0.2)
+    parser.add_argument("--debug_pair_checks", type=int, default=1)
+    parser.add_argument("--debug_pair_checks_events", type=int, default=1)
 
     args = parser.parse_args()
 
@@ -527,6 +795,8 @@ def main():
     learning_rate = args.learning_rate
     weight_decay = args.weight_decay
     print_every = args.print_every
+    debug_pair_checks = bool(args.debug_pair_checks)
+    debug_pair_checks_events = args.debug_pair_checks_events
 
     if args.run_name is None:
         run_name = f"MH11000_charge_E{num_epochs}_P{max_positive_pairs}_lr1e-3_true_validation"
@@ -608,10 +878,13 @@ def main():
     print("fourier_num_frequencies:", cfg.fourier_num_frequencies)
     print("dim_max:", cfg.dim_max)
     print("shift:", cfg.shift)
+    print("debug_pair_checks:", debug_pair_checks)
+    print("debug_pair_checks_events:", debug_pair_checks_events)
 
     global_step = 0
     epoch_history = []
     validation_history = []
+    training_debug_checks_done = 0
 
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
@@ -719,6 +992,22 @@ def main():
                 positive_scores = loss_debug["positive_scores"]
                 random_negative_scores = loss_debug["random_negative_scores"]
 
+                if debug_pair_checks and training_debug_checks_done < debug_pair_checks_events:
+                    print_pair_truth_debug(
+                        stage="training",
+                        epoch=epoch,
+                        file_idx=file_idx,
+                        event_idx=event_idx,
+                        pairs1=pairs1,
+                        pairs2=pairs2,
+                        target=target,
+                        particle_ids=particle_ids,
+                        padding_mask=batched_mask,
+                        attention_map=attention_map,
+                        loss_debug=loss_debug,
+                    )
+                    training_debug_checks_done += 1
+
                 with torch.no_grad():
                     if positive_scores.numel() > 0:
                         positive_sigmoid = torch.sigmoid(positive_scores)
@@ -822,10 +1111,13 @@ def main():
             dataset=dataset,
             cfg=cfg,
             validation_file_indices=validation_file_indices,
+            epoch=epoch,
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
             max_eval_events=args.max_eval_events,
             random_seed=12345,
+            debug_pair_checks=debug_pair_checks,
+            debug_pair_checks_events=debug_pair_checks_events,
         )
 
         validation_history.append(
