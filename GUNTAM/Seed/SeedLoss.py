@@ -315,7 +315,7 @@ def top_attention_loss(
 
                 pos_choice = torch.randint(
                     low=0,
-                    high=num_pos,
+                    high=num_pos, # excluded
                     size=(1,),
                     device=device,
                 ).item()
