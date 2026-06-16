@@ -1011,9 +1011,40 @@ def main():
                     target,
                     particle_ids,
                     batched_mask,
+                    hits=batched_hits,
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
+                    negative_sampling="local",
+                    local_negative_k=50,
+                    local_candidate_pool=512,
+                    debug_print=False,
                 )
+                
+                # loss, loss_debug = top_attention_loss(
+                #     attention_map,
+                #     pairs1,
+                #     pairs2,
+                #     target,
+                #     particle_ids,
+                #     batched_mask,
+                #     return_debug=True,
+                #     hard_negative_fraction=hard_negative_fraction,
+                # )
+
+
+                # loss, loss_debug = top_attention_loss(
+                #     attention_map,
+                #     pairs1,
+                #     pairs2,
+                #     target,
+                #     particle_ids,
+                #     batched_mask,
+                #     return_debug=True,
+                #     hard_negative_fraction=hard_negative_fraction,
+                #     negative_sampling="global",
+                #     debug_print=False,
+                # )
+
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(
