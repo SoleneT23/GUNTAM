@@ -114,9 +114,6 @@ def full_attention_loss(
     return F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
 
 
-
-
-
 def top_attention_loss(
     attention_map_bin: torch.Tensor,
     pairs1: torch.Tensor,
@@ -124,8 +121,13 @@ def top_attention_loss(
     target: torch.Tensor,
     particle_ids: torch.Tensor,
     padding_mask: torch.Tensor,
+    hits: torch.Tensor | None = None,
     return_debug: bool = False,
     hard_negative_fraction: float = 0.2,
+    negative_sampling: str = "global",
+    local_negative_k: int = 50,
+    local_candidate_pool: int = 512,
+    local_coord_dims=(0, 1, 2),
     debug_print: bool = False,
 ) -> torch.Tensor:
     device = attention_map_bin.device
@@ -157,7 +159,6 @@ def top_attention_loss(
     padding_mask = padding_mask.bool()
 
     real_hit_mask = ~padding_mask
-
     real_hit_mask = real_hit_mask[:seq_len]
     particle_ids = particle_ids[:seq_len]
 
@@ -166,22 +167,23 @@ def top_attention_loss(
 
     pos_mask = target > 0
 
+    empty_scores = torch.empty(0, device=device, dtype=dtype)
+
     if not torch.any(pos_mask):
         loss = torch.tensor(0.0, device=device, dtype=dtype)
 
         if return_debug:
-            debug_info = {
-                "positive_scores": torch.empty(0, device=device, dtype=dtype),
-                "negative_scores": torch.empty(0, device=device, dtype=dtype),
-                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
-                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+            return loss, {
+                "positive_scores": empty_scores,
+                "negative_scores": empty_scores,
+                "random_negative_scores": empty_scores,
+                "hard_negative_scores": empty_scores,
                 "num_positive_pairs": torch.tensor(0, device=device),
                 "num_negative_candidates": torch.tensor(0, device=device),
                 "num_selected_negatives": torch.tensor(0, device=device),
                 "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
                 "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
             }
-            return loss, debug_info
 
         return loss
 
@@ -208,18 +210,17 @@ def top_attention_loss(
         loss = torch.tensor(0.0, device=device, dtype=dtype)
 
         if return_debug:
-            debug_info = {
-                "positive_scores": torch.empty(0, device=device, dtype=dtype),
-                "negative_scores": torch.empty(0, device=device, dtype=dtype),
-                "random_negative_scores": torch.empty(0, device=device, dtype=dtype),
-                "hard_negative_scores": torch.empty(0, device=device, dtype=dtype),
+            return loss, {
+                "positive_scores": empty_scores,
+                "negative_scores": empty_scores,
+                "random_negative_scores": empty_scores,
+                "hard_negative_scores": empty_scores,
                 "num_positive_pairs": torch.tensor(0, device=device),
                 "num_negative_candidates": torch.tensor(0, device=device),
                 "num_selected_negatives": torch.tensor(0, device=device),
                 "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
                 "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
             }
-            return loss, debug_info
 
         return loss
 
@@ -239,61 +240,16 @@ def top_attention_loss(
     )
 
     neg_scores = attention_map_bin[neg_mask]
-
-    if debug_print:
-        pos_left_ids = particle_ids[pos_i]
-        pos_right_ids = particle_ids[pos_j]
-        pos_same = pos_left_ids == pos_right_ids
-
-        print()
-        print("=" * 80)
-        print("TOP ATTENTION LOSS DEBUG")
-        print("seq_len:", seq_len)
-        print("padding_mask true count:", padding_mask.sum().item())
-        print("padding_mask false count:", (~padding_mask).sum().item())
-        print("real_hit_mask count:", real_hit_mask.sum().item())
-        print("real_particle_ids numel:", real_particle_ids.numel())
-        print("unique_real_particle_ids:", unique_real_particle_ids.numel())
-        print("unique_real_particle_ids first 20:", unique_real_particle_ids[:20].detach().cpu())
-        print("num_pos:", num_pos)
-        print("positive same-particle count:", pos_same.sum().item())
-        print("positive different-particle count:", (~pos_same).sum().item())
-        print("num_negative_candidates:", neg_scores.numel())
-
-        if num_pos > 0:
-            preview = min(10, num_pos)
-            print("first positive pairs:")
-            for k in range(preview):
-                print(
-                    int(pos_i[k].item()),
-                    int(pos_j[k].item()),
-                    int(pos_left_ids[k].item()),
-                    int(pos_right_ids[k].item()),
-                    bool(pos_same[k].item()),
-                    float(torch.sigmoid(pos_scores[k]).item()),
-                )
-
-        if neg_scores.numel() > 0:
-            print("negative score sigmoid mean:", torch.sigmoid(neg_scores).mean().item())
-            print("negative score sigmoid min:", torch.sigmoid(neg_scores).min().item())
-            print("negative score sigmoid max:", torch.sigmoid(neg_scores).max().item())
-
-        print("=" * 80)
-        print()
-
     total_num_neg = min(num_pos, neg_scores.numel())
 
+    hard_negative_fraction = max(0.0, min(1.0, float(hard_negative_fraction)))
+
     if total_num_neg == 0:
-        random_neg_scores = torch.empty(0, device=device, dtype=dtype)
-        hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
-        mixed_neg_scores = torch.empty(0, device=device, dtype=dtype)
+        random_neg_scores = empty_scores
+        hard_neg_scores = empty_scores
+        mixed_neg_scores = empty_scores
 
     else:
-        hard_negative_fraction = max(
-            0.0,
-            min(1.0, float(hard_negative_fraction)),
-        )
-
         num_hard = int(total_num_neg * hard_negative_fraction)
         num_random = total_num_neg - num_hard
 
@@ -305,10 +261,13 @@ def top_attention_loss(
                 sorted=False,
             )
         else:
-            hard_neg_scores = torch.empty(0, device=device, dtype=dtype)
+            hard_neg_scores = empty_scores
             hard_indices = torch.empty(0, device=device, dtype=torch.long)
 
-        if num_random > 0:
+        if num_random == 0:
+            random_neg_scores = empty_scores
+
+        elif negative_sampling == "global":
             remaining_mask = torch.ones(
                 neg_scores.numel(),
                 dtype=torch.bool,
@@ -321,12 +280,9 @@ def top_attention_loss(
             remaining_scores = neg_scores[remaining_mask]
 
             if remaining_scores.numel() == 0:
-                random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+                random_neg_scores = empty_scores
             else:
-                actual_num_random = min(
-                    num_random,
-                    remaining_scores.numel(),
-                )
+                actual_num_random = min(num_random, remaining_scores.numel())
 
                 random_indices = torch.randperm(
                     remaining_scores.numel(),
@@ -335,8 +291,94 @@ def top_attention_loss(
 
                 random_neg_scores = remaining_scores[random_indices]
 
+        elif negative_sampling == "local":
+            if hits is None:
+                raise ValueError("negative_sampling='local' requires hits to be passed to top_attention_loss.")
+
+            hits = hits.to(device)
+
+            if hits.dim() == 3:
+                hits = hits[0]
+
+            hits = hits[:seq_len]
+            coords = hits[:, list(local_coord_dims)].float()
+
+            valid_indices = torch.where(real_hit_mask)[0]
+            local_neg_i = []
+            local_neg_j = []
+
+            max_trials = num_random * 20
+            trial = 0
+
+            while len(local_neg_i) < num_random and trial < max_trials:
+                trial += 1
+
+                pos_choice = torch.randint(
+                    low=0,
+                    high=num_pos,
+                    size=(1,),
+                    device=device,
+                ).item()
+
+                anchor_i = pos_i[pos_choice]
+                reference_j = pos_j[pos_choice]
+                anchor_particle = particle_ids[anchor_i]
+
+                candidate_mask = particle_ids[valid_indices] != anchor_particle
+                candidate_indices = valid_indices[candidate_mask]
+
+                if candidate_indices.numel() == 0:
+                    continue
+
+                if candidate_indices.numel() > local_candidate_pool:
+                    sampled_positions = torch.randperm(
+                        candidate_indices.numel(),
+                        device=device,
+                    )[:local_candidate_pool]
+                    candidate_indices = candidate_indices[sampled_positions]
+
+                distances = torch.sum(
+                    (coords[candidate_indices] - coords[reference_j]) ** 2,
+                    dim=-1,
+                )
+
+                k = min(local_negative_k, candidate_indices.numel())
+
+                closest_positions = torch.topk(
+                    distances,
+                    k=k,
+                    largest=False,
+                    sorted=False,
+                ).indices
+
+                chosen_position = closest_positions[
+                    torch.randint(
+                        low=0,
+                        high=closest_positions.numel(),
+                        size=(1,),
+                        device=device,
+                    ).item()
+                ]
+
+                neg_j = candidate_indices[chosen_position]
+
+                if not torch.isfinite(attention_map_bin[anchor_i, neg_j]):
+                    continue
+
+                local_neg_i.append(anchor_i)
+                local_neg_j.append(neg_j)
+
+            if len(local_neg_i) == 0:
+                random_neg_scores = empty_scores
+            else:
+                local_neg_i = torch.stack(local_neg_i)
+                local_neg_j = torch.stack(local_neg_j)
+                random_neg_scores = attention_map_bin[local_neg_i, local_neg_j]
+
         else:
-            random_neg_scores = torch.empty(0, device=device, dtype=dtype)
+            raise ValueError(
+                f"Unknown negative_sampling={negative_sampling}. Use 'global' or 'local'."
+            )
 
         mixed_neg_scores = torch.cat(
             [
@@ -345,6 +387,40 @@ def top_attention_loss(
             ],
             dim=0,
         )
+
+    if debug_print:
+        pos_left_ids = particle_ids[pos_i]
+        pos_right_ids = particle_ids[pos_j]
+        pos_same = pos_left_ids == pos_right_ids
+
+        print()
+        print("=" * 80)
+        print("TOP ATTENTION LOSS DEBUG")
+        print("negative_sampling:", negative_sampling)
+        print("seq_len:", seq_len)
+        print("padding_mask true count:", padding_mask.sum().item())
+        print("padding_mask false count:", (~padding_mask).sum().item())
+        print("real_hit_mask count:", real_hit_mask.sum().item())
+        print("unique_real_particle_ids:", unique_real_particle_ids.numel())
+        print("num_pos:", num_pos)
+        print("positive same-particle count:", pos_same.sum().item())
+        print("positive different-particle count:", (~pos_same).sum().item())
+        print("num_negative_candidates:", neg_scores.numel())
+        print("num_selected_random_negatives:", random_neg_scores.numel())
+        print("num_selected_hard_negatives:", hard_neg_scores.numel())
+        print("num_selected_negatives:", mixed_neg_scores.numel())
+
+        if pos_scores.numel() > 0:
+            print("positive sigmoid mean:", torch.sigmoid(pos_scores).mean().item())
+
+        if random_neg_scores.numel() > 0:
+            print("random negative sigmoid mean:", torch.sigmoid(random_neg_scores).mean().item())
+
+        if hard_neg_scores.numel() > 0:
+            print("hard negative sigmoid mean:", torch.sigmoid(hard_neg_scores).mean().item())
+
+        print("=" * 80)
+        print()
 
     logits = torch.cat(
         [
@@ -404,6 +480,8 @@ def top_attention_loss(
         return loss, debug_info
 
     return loss
+
+
 
 def attention_next_loss(
     attention_map_bin: torch.Tensor,  # [seq_len, seq_len] attention map logits
