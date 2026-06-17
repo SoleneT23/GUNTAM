@@ -28,7 +28,15 @@ def get_hard_negative_fraction(epoch):
     # if epoch < 40:
     #     return 0.4
     # return 0.5
-    return 0.0
+    # return 0.0
+    
+    if epoch < 2:
+        return 0.0
+    if epoch < 10:
+        return 0.2
+    if epoch < 20:
+        return 0.5
+    return 0.8
 
 
 def get_phases():
