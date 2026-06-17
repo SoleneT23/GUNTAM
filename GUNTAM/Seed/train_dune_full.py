@@ -786,8 +786,13 @@ def build_config():
 
     cfg.device_acc = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg.input_tensor_path = "/gpfs/workdir/thibauts/tensor_output_charge_MH11000"
-    cfg.dataset_name = "seeding_data_charge_MH11000"
+    # Données non normalisées
+    # cfg.input_tensor_path = "/gpfs/workdir/thibauts/tensor_output_charge_MH11000"
+    # cfg.dataset_name = "seeding_data_charge_MH11000"
+    
+    # Données normalisées avec log1p appliqué à la charge
+    cfg.input_tensor_path = "/gpfs/workdir/thibauts/tensor_output_charge_log_norm_MH11000"
+    cfg.dataset_name = "seeding_data_charge_log_norm_MH11000"
 
     cfg.embedding_feature = [0, 1, 2, 3]
     cfg.high_level_features = []
