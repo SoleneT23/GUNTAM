@@ -515,6 +515,53 @@ def _orphan_hit_removal(data_batch: pd.DataFrame, fraction_to_drop: float, rando
     return data_batch
 
 
+def _log1p_charge_and_normalize_hit_features(
+    data_batch: pd.DataFrame,
+    hit_features: List[str],
+    eps: float = 1e-6,
+) -> pd.DataFrame:
+    """
+    Apply log1p to charge, then normalize hit features.
+
+    Important:
+    - Only real hits are used to compute mean/std.
+    - Padding rows are kept at 0.
+    - This normalizes per tensor file/batch, not per event.
+    """
+    data_batch = data_batch.copy()
+
+    if "is_padding" in data_batch.columns:
+        real_mask = ~data_batch["is_padding"].astype(bool)
+    else:
+        real_mask = data_batch["particle_id"] != -2
+
+    if "charge" in hit_features:
+        data_batch.loc[real_mask, "charge"] = np.log1p(
+            data_batch.loc[real_mask, "charge"].clip(lower=0)
+        )
+
+    print("    Normalizing hit features:")
+    for feature in hit_features:
+        real_values = data_batch.loc[real_mask, feature].astype(float)
+
+        mean = real_values.mean()
+        std = real_values.std()
+
+        if not np.isfinite(std) or std < eps:
+            std = 1.0
+
+        data_batch.loc[real_mask, feature] = (
+            data_batch.loc[real_mask, feature] - mean
+        ) / (std + eps)
+
+        data_batch.loc[~real_mask, feature] = 0.0
+
+        print(f"      {feature}: mean={mean:.6g}, std={std:.6g}")
+
+    return data_batch
+
+
+
 def _save_tensor_data(
     file_data: Dict,
     file_path: str,
@@ -580,13 +627,19 @@ def _process_single_batch(args: Tuple) -> Tuple[str, Tuple[int, int], int, int]:
 
     # Pad or truncate each event to cfg.max_hit_input rows 
     data_batch = _add_padding(data_batch, cfg)
-    
+
+    # Apply log1p(charge), then normalize x, y, z, charge
+    data_batch = _log1p_charge_and_normalize_hit_features(
+        data_batch=data_batch,
+        hit_features=hit_features,
+    )
+
     # Build padding mask from the temporary 'is_padding' column
     data_batch, padding_mask = _create_padding_mask(data_batch, cfg)
 
     # Create hit-to-particle mapping 
     hit_to_particle = data_batch["particle_id"].copy()
-    
+
     # Convert to tensors
     hits_tensor, hit_to_particle_tensor = _to_tensor(
         data_batch=data_batch,
