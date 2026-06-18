@@ -28,15 +28,15 @@ def get_hard_negative_fraction(epoch):
     # if epoch < 40:
     #     return 0.4
     # return 0.5
-    # return 0.0
+    return 0.0
     
-    if epoch < 2:
-        return 0.0
-    if epoch < 10:
-        return 0.2
-    if epoch < 20:
-        return 0.5
-    return 0.8
+    # if epoch < 2:
+    #     return 0.0
+    # if epoch < 10:
+    #     return 0.2
+    # if epoch < 20:
+    #     return 0.5
+    # return 0.8
 
 
 def get_phases():
@@ -662,6 +662,18 @@ def evaluate_model_after_epoch(
                 batched_mask_cpu = padding_mask[event_idx]
                 particle_ids_cpu = hit_to_particle_tensor[event_idx, 0]
 
+                particle_ids_flat = flatten_particle_ids(particle_ids_cpu)
+                padding_mask_flat = flatten_mask(batched_mask_cpu)
+                real_hit_mask = (~padding_mask_flat) & (particle_ids_flat >= 0)
+                real_particle_ids = particle_ids_flat[real_hit_mask]
+                unique_ids, counts = torch.unique(real_particle_ids, return_counts=True)
+                has_positive_pair = bool((counts >= 2).any().item())
+                has_negative_pair = unique_ids.numel() >= 2
+
+                if not (has_positive_pair and has_negative_pair):
+                    skipped_events += 1
+                    continue
+
                 pairs1, pairs2, target = sample_positive_pairs_from_particle_ids(
                     particle_ids_cpu,
                     max_positive_pairs=max_positive_pairs,
@@ -990,6 +1002,18 @@ def main():
                 batched_hits_cpu = hits_tensor[event_idx]
                 batched_mask_cpu = padding_mask[event_idx]
                 particle_ids_cpu = hit_to_particle_tensor[event_idx, 0]
+
+                particle_ids_flat = flatten_particle_ids(particle_ids_cpu)
+                padding_mask_flat = flatten_mask(batched_mask_cpu)
+                real_hit_mask = (~padding_mask_flat) & (particle_ids_flat >= 0)
+                real_particle_ids = particle_ids_flat[real_hit_mask]
+                unique_ids, counts = torch.unique(real_particle_ids, return_counts=True)
+                has_positive_pair = bool((counts >= 2).any().item())
+                has_negative_pair = unique_ids.numel() >= 2
+
+                if not (has_positive_pair and has_negative_pair):
+                    skipped_events += 1
+                    continue
 
                 pairs1, pairs2, target = sample_positive_pairs_from_particle_ids(
                     particle_ids_cpu,
