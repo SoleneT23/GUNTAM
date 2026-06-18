@@ -227,158 +227,178 @@ def top_attention_loss(
     pos_scores = attention_map_bin[pos_i, pos_j]
     num_pos = pos_scores.numel()
 
-    valid_pair_mask = real_hit_mask[:, None] & real_hit_mask[None, :]
-    same_particle_mask = particle_ids[:, None] == particle_ids[None, :]
-
-    eye = torch.eye(seq_len, dtype=torch.bool, device=device)
-
-    neg_mask = (
-        valid_pair_mask
-        & (~same_particle_mask)
-        & (~eye)
-        & torch.isfinite(attention_map_bin)
-    )
-
-    neg_scores = attention_map_bin[neg_mask]
-    total_num_neg = min(num_pos, neg_scores.numel())
-
     hard_negative_fraction = max(0.0, min(1.0, float(hard_negative_fraction)))
+    total_num_neg = num_pos
+    num_negative_candidates = torch.tensor(0, device=device)
 
-    if total_num_neg == 0:
+    if unique_real_particle_ids.numel() < 2:
         random_neg_scores = empty_scores
         hard_neg_scores = empty_scores
         mixed_neg_scores = empty_scores
 
-    else:
+    elif negative_sampling == "local":
+        if hits is None:
+            raise ValueError("negative_sampling='local' requires hits to be passed to top_attention_loss.")
+
+        hits = hits.to(device)
+
+        if hits.dim() == 3:
+            hits = hits[0]
+
+        hits = hits[:seq_len]
+        coords = hits[:, list(local_coord_dims)].float()
+        valid_indices = torch.where(real_hit_mask)[0]
+
+        def sample_local_negative_scores(num_samples: int) -> torch.Tensor:
+            if num_samples <= 0 or valid_indices.numel() < 2:
+                return empty_scores
+
+            sample_count = int(num_samples)
+            candidate_pool = max(1, int(local_candidate_pool))
+            nearest_k = max(1, min(int(local_negative_k), candidate_pool))
+
+            pos_choices = torch.randint(
+                low=0,
+                high=num_pos,
+                size=(sample_count,),
+                device=device,
+            )
+
+            anchor_i = pos_i[pos_choices]
+            reference_j = pos_j[pos_choices]
+            anchor_particle = particle_ids[anchor_i]
+
+            candidate_positions = torch.randint(
+                low=0,
+                high=valid_indices.numel(),
+                size=(sample_count, candidate_pool),
+                device=device,
+            )
+            candidate_indices = valid_indices[candidate_positions]
+
+            same_particle = particle_ids[candidate_indices] == anchor_particle[:, None]
+
+            for _ in range(8):
+                if not same_particle.any():
+                    break
+
+                replacement_positions = torch.randint(
+                    low=0,
+                    high=valid_indices.numel(),
+                    size=(same_particle.sum().item(),),
+                    device=device,
+                )
+                candidate_indices[same_particle] = valid_indices[replacement_positions]
+                same_particle = particle_ids[candidate_indices] == anchor_particle[:, None]
+
+            candidate_scores = attention_map_bin[anchor_i[:, None], candidate_indices]
+            valid_candidate = (
+                (particle_ids[candidate_indices] != anchor_particle[:, None])
+                & torch.isfinite(candidate_scores)
+            )
+
+            if not valid_candidate.any():
+                return empty_scores
+
+            distances = torch.sum(
+                (coords[candidate_indices] - coords[reference_j][:, None, :]) ** 2,
+                dim=-1,
+            )
+            distances = torch.where(
+                valid_candidate,
+                distances,
+                torch.full_like(distances, float("inf")),
+            )
+
+            closest_positions = torch.topk(
+                distances,
+                k=nearest_k,
+                largest=False,
+                sorted=False,
+            ).indices
+
+            closest_distances = distances.gather(1, closest_positions)
+            valid_closest = torch.isfinite(closest_distances)
+
+            if not valid_closest.any():
+                return empty_scores
+
+            random_choice = torch.rand(
+                (sample_count, nearest_k),
+                device=device,
+            )
+            random_choice = torch.where(
+                valid_closest,
+                random_choice,
+                torch.full_like(random_choice, -1.0),
+            )
+
+            chosen_in_top = random_choice.argmax(dim=1)
+            chosen_positions = closest_positions.gather(
+                1,
+                chosen_in_top[:, None],
+            ).squeeze(1)
+
+            rows = torch.arange(sample_count, device=device)
+            neg_j = candidate_indices[rows, chosen_positions]
+            keep = (
+                valid_closest.any(dim=1)
+                & (particle_ids[neg_j] != anchor_particle)
+                & torch.isfinite(attention_map_bin[anchor_i, neg_j])
+            )
+
+            if not keep.any():
+                return empty_scores
+
+            return attention_map_bin[anchor_i[keep], neg_j[keep]]
+
         num_hard = int(total_num_neg * hard_negative_fraction)
         num_random = total_num_neg - num_hard
 
         if num_hard > 0:
-            hard_neg_scores, hard_indices = torch.topk(
-                neg_scores,
-                k=num_hard,
-                largest=True,
-                sorted=False,
+            local_score_pool_size = max(
+                total_num_neg,
+                num_random + 4 * num_hard,
             )
-        else:
-            hard_neg_scores = empty_scores
-            hard_indices = torch.empty(0, device=device, dtype=torch.long)
+            local_score_pool_size = min(local_score_pool_size, max(total_num_neg, 8192))
+            local_neg_scores = sample_local_negative_scores(local_score_pool_size)
+            num_negative_candidates = torch.tensor(local_neg_scores.numel(), device=device)
 
-        if num_random == 0:
-            random_neg_scores = empty_scores
-
-        elif negative_sampling == "global":
-            remaining_mask = torch.ones(
-                neg_scores.numel(),
-                dtype=torch.bool,
-                device=device,
-            )
-
-            if hard_indices.numel() > 0:
-                remaining_mask[hard_indices] = False
-
-            remaining_scores = neg_scores[remaining_mask]
-
-            if remaining_scores.numel() == 0:
+            if local_neg_scores.numel() == 0:
+                hard_neg_scores = empty_scores
                 random_neg_scores = empty_scores
             else:
-                actual_num_random = min(num_random, remaining_scores.numel())
-
-                random_indices = torch.randperm(
-                    remaining_scores.numel(),
-                    device=device,
-                )[:actual_num_random]
-
-                random_neg_scores = remaining_scores[random_indices]
-
-        elif negative_sampling == "local":
-            if hits is None:
-                raise ValueError("negative_sampling='local' requires hits to be passed to top_attention_loss.")
-
-            hits = hits.to(device)
-
-            if hits.dim() == 3:
-                hits = hits[0]
-
-            hits = hits[:seq_len]
-            coords = hits[:, list(local_coord_dims)].float()
-
-            valid_indices = torch.where(real_hit_mask)[0]
-            local_neg_i = []
-            local_neg_j = []
-
-            max_trials = num_random * 20
-            trial = 0
-
-            while len(local_neg_i) < num_random and trial < max_trials:
-                trial += 1
-
-                pos_choice = torch.randint(
-                    low=0,
-                    high=num_pos, # excluded
-                    size=(1,),
-                    device=device,
-                ).item()
-
-                anchor_i = pos_i[pos_choice]
-                reference_j = pos_j[pos_choice]
-                anchor_particle = particle_ids[anchor_i]
-
-                candidate_mask = particle_ids[valid_indices] != anchor_particle
-                candidate_indices = valid_indices[candidate_mask]
-
-                if candidate_indices.numel() == 0:
-                    continue
-
-                if candidate_indices.numel() > local_candidate_pool:
-                    sampled_positions = torch.randperm(
-                        candidate_indices.numel(),
-                        device=device,
-                    )[:local_candidate_pool]
-                    candidate_indices = candidate_indices[sampled_positions]
-
-                distances = torch.sum(
-                    (coords[candidate_indices] - coords[reference_j]) ** 2,
-                    dim=-1,
+                actual_num_hard = min(num_hard, local_neg_scores.numel())
+                hard_neg_scores, hard_indices = torch.topk(
+                    local_neg_scores,
+                    k=actual_num_hard,
+                    largest=True,
+                    sorted=False,
                 )
 
-                k = min(local_negative_k, candidate_indices.numel())
+                remaining_mask = torch.ones(
+                    local_neg_scores.numel(),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                remaining_mask[hard_indices] = False
+                remaining_scores = local_neg_scores[remaining_mask]
 
-                closest_positions = torch.topk(
-                    distances,
-                    k=k,
-                    largest=False,
-                    sorted=False,
-                ).indices
+                actual_num_random = min(num_random, remaining_scores.numel())
 
-                chosen_position = closest_positions[
-                    torch.randint(
-                        low=0,
-                        high=closest_positions.numel(),
-                        size=(1,),
+                if actual_num_random == 0:
+                    random_neg_scores = empty_scores
+                else:
+                    random_indices = torch.randperm(
+                        remaining_scores.numel(),
                         device=device,
-                    ).item()
-                ]
-
-                neg_j = candidate_indices[chosen_position]
-
-                if not torch.isfinite(attention_map_bin[anchor_i, neg_j]):
-                    continue
-
-                local_neg_i.append(anchor_i)
-                local_neg_j.append(neg_j)
-
-            if len(local_neg_i) == 0:
-                random_neg_scores = empty_scores
-            else:
-                local_neg_i = torch.stack(local_neg_i)
-                local_neg_j = torch.stack(local_neg_j)
-                random_neg_scores = attention_map_bin[local_neg_i, local_neg_j]
+                    )[:actual_num_random]
+                    random_neg_scores = remaining_scores[random_indices]
 
         else:
-            raise ValueError(
-                f"Unknown negative_sampling={negative_sampling}. Use 'global' or 'local'."
-            )
+            hard_neg_scores = empty_scores
+            random_neg_scores = sample_local_negative_scores(num_random)
+            num_negative_candidates = torch.tensor(random_neg_scores.numel(), device=device)
 
         mixed_neg_scores = torch.cat(
             [
@@ -387,6 +407,83 @@ def top_attention_loss(
             ],
             dim=0,
         )
+
+    else:
+        valid_pair_mask = real_hit_mask[:, None] & real_hit_mask[None, :]
+        same_particle_mask = particle_ids[:, None] == particle_ids[None, :]
+
+        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
+
+        neg_mask = (
+            valid_pair_mask
+            & (~same_particle_mask)
+            & (~eye)
+            & torch.isfinite(attention_map_bin)
+        )
+
+        neg_scores = attention_map_bin[neg_mask]
+        num_negative_candidates = torch.tensor(neg_scores.numel(), device=device)
+        total_num_neg = min(num_pos, neg_scores.numel())
+
+        if total_num_neg == 0:
+            random_neg_scores = empty_scores
+            hard_neg_scores = empty_scores
+            mixed_neg_scores = empty_scores
+
+        else:
+            num_hard = int(total_num_neg * hard_negative_fraction)
+            num_random = total_num_neg - num_hard
+
+            if num_hard > 0:
+                hard_neg_scores, hard_indices = torch.topk(
+                    neg_scores,
+                    k=num_hard,
+                    largest=True,
+                    sorted=False,
+                )
+            else:
+                hard_neg_scores = empty_scores
+                hard_indices = torch.empty(0, device=device, dtype=torch.long)
+
+            if num_random == 0:
+                random_neg_scores = empty_scores
+
+            elif negative_sampling == "global":
+                remaining_mask = torch.ones(
+                    neg_scores.numel(),
+                    dtype=torch.bool,
+                    device=device,
+                )
+
+                if hard_indices.numel() > 0:
+                    remaining_mask[hard_indices] = False
+
+                remaining_scores = neg_scores[remaining_mask]
+
+                if remaining_scores.numel() == 0:
+                    random_neg_scores = empty_scores
+                else:
+                    actual_num_random = min(num_random, remaining_scores.numel())
+
+                    random_indices = torch.randperm(
+                        remaining_scores.numel(),
+                        device=device,
+                    )[:actual_num_random]
+
+                    random_neg_scores = remaining_scores[random_indices]
+
+            else:
+                raise ValueError(
+                    f"Unknown negative_sampling={negative_sampling}. Use 'global' or 'local'."
+                )
+
+            mixed_neg_scores = torch.cat(
+                [
+                    random_neg_scores,
+                    hard_neg_scores,
+                ],
+                dim=0,
+            )
 
     if debug_print:
         pos_left_ids = particle_ids[pos_i]
@@ -405,7 +502,7 @@ def top_attention_loss(
         print("num_pos:", num_pos)
         print("positive same-particle count:", pos_same.sum().item())
         print("positive different-particle count:", (~pos_same).sum().item())
-        print("num_negative_candidates:", neg_scores.numel())
+        print("num_negative_candidates:", num_negative_candidates.item())
         print("num_selected_random_negatives:", random_neg_scores.numel())
         print("num_selected_hard_negatives:", hard_neg_scores.numel())
         print("num_selected_negatives:", mixed_neg_scores.numel())
@@ -472,7 +569,7 @@ def top_attention_loss(
             "random_negative_scores": random_neg_scores.detach(),
             "hard_negative_scores": hard_neg_scores.detach(),
             "num_positive_pairs": torch.tensor(num_pos, device=device),
-            "num_negative_candidates": torch.tensor(neg_scores.numel(), device=device),
+            "num_negative_candidates": num_negative_candidates,
             "num_selected_negatives": torch.tensor(mixed_neg_scores.numel(), device=device),
             "num_real_hits": torch.tensor(real_hit_mask.sum().item(), device=device),
             "num_unique_real_particle_ids": torch.tensor(unique_real_particle_ids.numel(), device=device),
