@@ -14,52 +14,8 @@ from GUNTAM.Seed.Config import SeedConfig
 from GUNTAM.Seed.SeedLoss import top_attention_loss
 from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
-
 def get_hard_negative_fraction(epoch):
-    
-    # if epoch < 3:
-    #     return 0.0
-    # if epoch < 10:
-    #     return 0.1
-    # if epoch < 20:
-    #     return 0.2
-    # if epoch < 30:
-    #     return 0.3
-    # if epoch < 40:
-    #     return 0.4
-    # return 0.5
     return 0.0
-    
-    # if epoch < 2:
-    #     return 0.0
-    # if epoch < 10:
-    #     return 0.2
-    # if epoch < 20:
-    #     return 0.5
-    # return 0.8
-
-
-def get_phases():
-    return [
-        (1, 3, 0.0, "#e0e0e0"),
-        (4, 10, 0.1, "#1f78b4"),
-        (11, 20, 0.2, "#33a02c"),
-        (21, 30, 0.3, "#ff7f00"),
-        (31, 40, 0.4, "#e31a1c"),
-        (41, 50, 0.5, "#6a3d9a"),
-    ]
-
-
-def add_phase_background(max_epoch):
-    for start_epoch, end_epoch, frac, color in get_phases():
-        if start_epoch <= max_epoch:
-            plt.axvspan(
-                start_epoch - 0.5,
-                min(end_epoch, max_epoch) + 0.5,
-                color=color,
-                alpha=0.22,
-                label=f"hard neg frac = {frac}",
-            )
 
 
 def split_file_indices(num_files, validation_fraction):
@@ -82,7 +38,6 @@ def split_file_indices(num_files, validation_fraction):
 
     return train_file_indices, validation_file_indices
 
-
 def flatten_particle_ids(particle_ids):
     if particle_ids.dim() == 3:
         particle_ids = particle_ids[0, :, 0]
@@ -96,7 +51,6 @@ def flatten_particle_ids(particle_ids):
 
     return particle_ids.long()
 
-
 def flatten_mask(padding_mask):
     if padding_mask.dim() == 2:
         padding_mask = padding_mask[0]
@@ -104,7 +58,6 @@ def flatten_mask(padding_mask):
         padding_mask = padding_mask.view(-1)
 
     return padding_mask.bool()
-
 
 def tensor_stats(name, tensor):
     if tensor is None or tensor.numel() == 0:
@@ -124,7 +77,6 @@ def tensor_stats(name, tensor):
         tensor.mean().item(),
     )
 
-
 def get_debug_pair_tensors(loss_debug, possible_left_names, possible_right_names):
     left = None
     right = None
@@ -141,8 +93,7 @@ def get_debug_pair_tensors(loss_debug, possible_left_names, possible_right_names
 
     return left, right
 
-
-def sample_debug_random_negatives(particle_ids, valid_mask, num_pairs, device):
+def sample_debug_negative_pairs(particle_ids, valid_mask, num_pairs, device):
     valid_indices = torch.where(valid_mask & (particle_ids >= 0))[0]
 
     if valid_indices.numel() < 2:
@@ -181,7 +132,6 @@ def sample_debug_random_negatives(particle_ids, valid_mask, num_pairs, device):
         return None, None
 
     return torch.stack(sampled_left), torch.stack(sampled_right)
-
 
 def print_pair_truth_debug(
     stage,
@@ -280,10 +230,10 @@ def print_pair_truth_debug(
         loss_neg_right_ids = particle_ids[loss_neg_right]
         loss_neg_different = loss_neg_left_ids != loss_neg_right_ids
 
-        print("loss random negative pair count:", loss_neg_left.numel())
-        print("loss random negative different-particle count:", loss_neg_different.sum().item())
-        print("loss random negative same-particle count:", (~loss_neg_different).sum().item())
-        print("first loss random negative pairs:")
+        print("loss negative pair count:", loss_neg_left.numel())
+        print("loss negative different-particle count:", loss_neg_different.sum().item())
+        print("loss negative same-particle count:", (~loss_neg_different).sum().item())
+        print("first loss negative pairs:")
 
         preview_count = min(10, loss_neg_left.numel())
         for k in range(preview_count):
@@ -295,9 +245,9 @@ def print_pair_truth_debug(
                 bool(loss_neg_different[k].item()),
             )
     else:
-        print("loss random negative pair indices: not present in loss_debug")
+        print("loss negative pair indices: not present in loss_debug")
 
-    debug_neg_left, debug_neg_right = sample_debug_random_negatives(
+    debug_neg_left, debug_neg_right = sample_debug_negative_pairs(
         particle_ids=particle_ids,
         valid_mask=valid_mask,
         num_pairs=10,
@@ -328,7 +278,6 @@ def print_pair_truth_debug(
     print("=" * 80)
     print()
 
-
 def save_metrics_csv(epoch_history, checkpoint_dir):
     metrics_csv_path = os.path.join(checkpoint_dir, "training_gap_metrics.csv")
 
@@ -340,8 +289,8 @@ def save_metrics_csv(epoch_history, checkpoint_dir):
                 "hard_negative_fraction",
                 "average_loss",
                 "mean_pos_sigmoid",
-                "mean_random_neg_sigmoid",
-                "gap_pos_random_neg",
+                "mean_negative_sigmoid",
+                "gap_pos_negative",
                 "successful_events",
                 "skipped_events",
             ],
@@ -350,7 +299,6 @@ def save_metrics_csv(epoch_history, checkpoint_dir):
         writer.writerows(epoch_history)
 
     print("Saved metrics CSV:", metrics_csv_path)
-
 
 def save_validation_metrics_csv(validation_history, checkpoint_dir):
     metrics_csv_path = os.path.join(checkpoint_dir, "validation_gap_metrics.csv")
@@ -363,8 +311,8 @@ def save_validation_metrics_csv(validation_history, checkpoint_dir):
                 "hard_negative_fraction",
                 "validation_average_loss",
                 "validation_mean_pos_sigmoid",
-                "validation_mean_random_neg_sigmoid",
-                "validation_gap_pos_random_neg",
+                "validation_mean_negative_sigmoid",
+                "validation_gap_pos_negative",
                 "evaluated_events",
                 "skipped_events",
             ],
@@ -373,7 +321,6 @@ def save_validation_metrics_csv(validation_history, checkpoint_dir):
         writer.writerows(validation_history)
 
     print("Saved validation metrics CSV:", metrics_csv_path)
-
 
 def save_train_eval_metrics_csv(train_eval_history, checkpoint_dir):
     metrics_csv_path = os.path.join(checkpoint_dir, "train_eval_gap_metrics.csv")
@@ -386,8 +333,8 @@ def save_train_eval_metrics_csv(train_eval_history, checkpoint_dir):
                 "hard_negative_fraction",
                 "train_eval_average_loss",
                 "train_eval_mean_pos_sigmoid",
-                "train_eval_mean_random_neg_sigmoid",
-                "train_eval_gap_pos_random_neg",
+                "train_eval_mean_negative_sigmoid",
+                "train_eval_gap_pos_negative",
                 "evaluated_events",
                 "skipped_events",
             ],
@@ -397,43 +344,40 @@ def save_train_eval_metrics_csv(train_eval_history, checkpoint_dir):
 
     print("Saved train-set evaluation metrics CSV:", metrics_csv_path)
 
-
 def save_gap_plot(epoch_history, attention_plot_dir):
     if len(epoch_history) == 0:
         return
 
     epochs_plot = [row["epoch"] for row in epoch_history]
-    gaps_plot = [row["gap_pos_random_neg"] for row in epoch_history]
+    gaps_plot = [row["gap_pos_negative"] for row in epoch_history]
     pos_plot = [row["mean_pos_sigmoid"] for row in epoch_history]
-    rand_neg_plot = [row["mean_random_neg_sigmoid"] for row in epoch_history]
+    neg_plot = [row["mean_negative_sigmoid"] for row in epoch_history]
 
     max_epoch = max(epochs_plot)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         gaps_plot,
         marker="o",
         linewidth=2,
         color="black",
-        label="gap: pos - random neg",
+        label="gap: pos - neg",
     )
     plt.xlabel("Epoch")
-    plt.ylabel("Mean sigmoid positive - mean sigmoid random negative")
-    plt.title("Training gap between positive pairs and random negative pairs")
+    plt.ylabel("Mean sigmoid positive - mean sigmoid negative")
+    plt.title("Training gap between positive pairs and negative pairs")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
     plt.legend(unique.values(), unique.keys(), loc="best")
     plt.tight_layout()
-    gap_plot_path = os.path.join(attention_plot_dir, "gap_pos_vs_random_neg.png")
+    gap_plot_path = os.path.join(attention_plot_dir, "gap_pos_vs_negative.png")
     plt.savefig(gap_plot_path, dpi=200)
     plt.close()
     print("Saved gap plot:", gap_plot_path)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         pos_plot,
@@ -444,25 +388,24 @@ def save_gap_plot(epoch_history, attention_plot_dir):
     )
     plt.plot(
         epochs_plot,
-        rand_neg_plot,
+        neg_plot,
         marker="s",
         linewidth=2,
         color="red",
-        label="mean sigmoid random negatives",
+        label="mean sigmoid negatives",
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid score")
-    plt.title("Training positive vs random negative sigmoid scores")
+    plt.title("Training positive vs negative sigmoid scores")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
     plt.legend(unique.values(), unique.keys(), loc="best")
     plt.tight_layout()
-    means_plot_path = os.path.join(attention_plot_dir, "mean_sigmoid_pos_vs_random_neg.png")
+    means_plot_path = os.path.join(attention_plot_dir, "mean_sigmoid_pos_vs_negative.png")
     plt.savefig(means_plot_path, dpi=200)
     plt.close()
     print("Saved sigmoid means plot:", means_plot_path)
-
 
 def save_loss_plot(epoch_history, attention_plot_dir):
     if len(epoch_history) == 0:
@@ -474,7 +417,6 @@ def save_loss_plot(epoch_history, attention_plot_dir):
     max_epoch = max(epochs_plot)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         losses_plot,
@@ -485,7 +427,7 @@ def save_loss_plot(epoch_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Average loss")
-    plt.title("Training average loss with progressive introduction of hard negatives")
+    plt.title("Training average loss")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -493,49 +435,46 @@ def save_loss_plot(epoch_history, attention_plot_dir):
     plt.tight_layout()
     loss_plot_path = os.path.join(
         attention_plot_dir,
-        "average_loss_progressive_introduction_of_hard_negatives.png",
+        "average_loss.png",
     )
     plt.savefig(loss_plot_path, dpi=200)
     plt.close()
     print("Saved loss plot:", loss_plot_path)
-
 
 def save_validation_gap_plot(validation_history, attention_plot_dir):
     if len(validation_history) == 0:
         return
 
     epochs_plot = [row["epoch"] for row in validation_history]
-    gaps_plot = [row["validation_gap_pos_random_neg"] for row in validation_history]
+    gaps_plot = [row["validation_gap_pos_negative"] for row in validation_history]
     pos_plot = [row["validation_mean_pos_sigmoid"] for row in validation_history]
-    rand_neg_plot = [row["validation_mean_random_neg_sigmoid"] for row in validation_history]
+    neg_plot = [row["validation_mean_negative_sigmoid"] for row in validation_history]
 
     max_epoch = max(epochs_plot)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         gaps_plot,
         marker="o",
         linewidth=2,
         color="black",
-        label="validation gap: pos - random neg",
+        label="validation gap: pos - neg",
     )
     plt.xlabel("Epoch")
-    plt.ylabel("Mean sigmoid positive - mean sigmoid random negative")
-    plt.title("Validation gap on unseen events")
+    plt.ylabel("Mean sigmoid positive - mean sigmoid negative")
+    plt.title("Held-out validation gap")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
     plt.legend(unique.values(), unique.keys(), loc="best")
     plt.tight_layout()
-    gap_plot_path = os.path.join(attention_plot_dir, "validation_gap_pos_vs_random_neg.png")
+    gap_plot_path = os.path.join(attention_plot_dir, "validation_gap_pos_vs_negative.png")
     plt.savefig(gap_plot_path, dpi=200)
     plt.close()
     print("Saved validation gap plot:", gap_plot_path)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         pos_plot,
@@ -546,15 +485,15 @@ def save_validation_gap_plot(validation_history, attention_plot_dir):
     )
     plt.plot(
         epochs_plot,
-        rand_neg_plot,
+        neg_plot,
         marker="s",
         linewidth=2,
         color="red",
-        label="validation mean sigmoid random negatives",
+        label="validation mean sigmoid negatives",
     )
     plt.xlabel("Epoch")
     plt.ylabel("Mean sigmoid score")
-    plt.title("Validation positive vs random negative sigmoid scores on unseen events")
+    plt.title("Held-out validation positive vs negative sigmoid scores")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -562,12 +501,11 @@ def save_validation_gap_plot(validation_history, attention_plot_dir):
     plt.tight_layout()
     means_plot_path = os.path.join(
         attention_plot_dir,
-        "validation_mean_sigmoid_pos_vs_random_neg.png",
+        "validation_mean_sigmoid_pos_vs_negative.png",
     )
     plt.savefig(means_plot_path, dpi=200)
     plt.close()
     print("Saved validation sigmoid means plot:", means_plot_path)
-
 
 def save_validation_loss_plot(validation_history, attention_plot_dir):
     if len(validation_history) == 0:
@@ -579,7 +517,6 @@ def save_validation_loss_plot(validation_history, attention_plot_dir):
     max_epoch = max(epochs_plot)
 
     plt.figure(figsize=(12, 6))
-    add_phase_background(max_epoch)
     plt.plot(
         epochs_plot,
         losses_plot,
@@ -590,7 +527,7 @@ def save_validation_loss_plot(validation_history, attention_plot_dir):
     )
     plt.xlabel("Epoch")
     plt.ylabel("Validation average loss")
-    plt.title("Validation average loss on unseen events")
+    plt.title("Held-out validation average loss")
     plt.grid(True, alpha=0.3)
     handles, labels = plt.gca().get_legend_handles_labels()
     unique = dict(zip(labels, handles))
@@ -598,18 +535,18 @@ def save_validation_loss_plot(validation_history, attention_plot_dir):
     plt.tight_layout()
     loss_plot_path = os.path.join(
         attention_plot_dir,
-        "validation_average_loss_progressive_introduction_of_hard_negatives.png",
+        "validation_average_loss.png",
     )
     plt.savefig(loss_plot_path, dpi=200)
     plt.close()
     print("Saved validation loss plot:", loss_plot_path)
 
-
 def evaluate_model_after_epoch(
     model,
     dataset,
     cfg,
-    validation_file_indices,
+    file_indices,
+    stage_name,
     epoch,
     hard_negative_fraction,
     max_positive_pairs,
@@ -620,15 +557,15 @@ def evaluate_model_after_epoch(
 ):
     model.eval()
 
-    eval_loss_sum = 0.0
+    loss_sum = 0.0
     evaluated_events = 0
     skipped_events = 0
 
-    eval_pos_sigmoid_sum = 0.0
-    eval_pos_count = 0
+    pos_sigmoid_sum = 0.0
+    pos_count = 0
 
-    eval_random_neg_sigmoid_sum = 0.0
-    eval_random_neg_count = 0
+    negative_sigmoid_sum = 0.0
+    negative_count = 0
     debug_checks_done = 0
 
     torch.manual_seed(random_seed)
@@ -637,13 +574,13 @@ def evaluate_model_after_epoch(
         torch.cuda.manual_seed_all(random_seed)
 
     with torch.no_grad():
-        for file_idx in validation_file_indices:
+        for file_idx in file_indices:
             if evaluated_events >= max_eval_events:
                 break
 
             print()
             print("=" * 80)
-            print(f"Validation: loading held-out file_idx={file_idx}")
+            print(f"{stage_name}: loading file_idx={file_idx}")
             print("=" * 80)
 
             file_data = dataset.get_file(file_idx)
@@ -716,12 +653,12 @@ def evaluate_model_after_epoch(
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(
-                        f"Non-finite validation loss at file_idx={file_idx}, event_idx={event_idx}: {loss.item()}"
+                        f"Non-finite {stage_name} loss at file_idx={file_idx}, event_idx={event_idx}: {loss.item()}"
                     )
 
                 if debug_pair_checks and debug_checks_done < debug_pair_checks_events:
                     print_pair_truth_debug(
-                        stage="validation",
+                        stage=stage_name,
                         epoch=epoch,
                         file_idx=file_idx,
                         event_idx=event_idx,
@@ -735,24 +672,24 @@ def evaluate_model_after_epoch(
                     )
                     debug_checks_done += 1
 
-                eval_loss_sum += loss.item()
+                loss_sum += loss.item()
                 evaluated_events += 1
 
                 positive_scores = loss_debug["positive_scores"]
-                random_negative_scores = loss_debug["random_negative_scores"]
+                negative_scores = loss_debug["random_negative_scores"]
 
                 if positive_scores.numel() > 0:
                     positive_sigmoid = torch.sigmoid(positive_scores)
-                    eval_pos_sigmoid_sum += positive_sigmoid.sum().item()
-                    eval_pos_count += positive_sigmoid.numel()
+                    pos_sigmoid_sum += positive_sigmoid.sum().item()
+                    pos_count += positive_sigmoid.numel()
 
-                if random_negative_scores.numel() > 0:
-                    random_negative_sigmoid = torch.sigmoid(random_negative_scores)
-                    eval_random_neg_sigmoid_sum += random_negative_sigmoid.sum().item()
-                    eval_random_neg_count += random_negative_sigmoid.numel()
+                if negative_scores.numel() > 0:
+                    negative_sigmoid = torch.sigmoid(negative_scores)
+                    negative_sigmoid_sum += negative_sigmoid.sum().item()
+                    negative_count += negative_sigmoid.numel()
 
                 if evaluated_events % 20 == 0:
-                    print(f"Validation evaluated events: {evaluated_events}/{max_eval_events}")
+                    print(f"{stage_name} evaluated events: {evaluated_events}/{max_eval_events}")
 
             del file_data
             del hits_tensor
@@ -762,47 +699,41 @@ def evaluate_model_after_epoch(
             if cfg.device_acc.type == "cuda":
                 torch.cuda.empty_cache()
 
-    validation_average_loss = eval_loss_sum / evaluated_events if evaluated_events > 0 else float("nan")
-    validation_mean_pos_sigmoid = eval_pos_sigmoid_sum / eval_pos_count if eval_pos_count > 0 else float("nan")
-    validation_mean_random_neg_sigmoid = (
-        eval_random_neg_sigmoid_sum / eval_random_neg_count
-        if eval_random_neg_count > 0
+    average_loss = loss_sum / evaluated_events if evaluated_events > 0 else float("nan")
+    mean_pos_sigmoid = pos_sigmoid_sum / pos_count if pos_count > 0 else float("nan")
+    mean_negative_sigmoid = (
+        negative_sigmoid_sum / negative_count
+        if negative_count > 0
         else float("nan")
     )
-    validation_gap_pos_random_neg = validation_mean_pos_sigmoid - validation_mean_random_neg_sigmoid
+    gap_pos_negative = mean_pos_sigmoid - mean_negative_sigmoid
 
     print()
     print("=" * 80)
-    print("Validation summary on held-out events")
+    print(f"{stage_name} summary")
     print("hard_negative_fraction:", hard_negative_fraction)
     print("evaluated_events:", evaluated_events)
     print("skipped_events:", skipped_events)
-    print("validation_average_loss:", validation_average_loss)
-    print("validation_mean_pos_sigmoid:", validation_mean_pos_sigmoid)
-    print("validation_mean_random_neg_sigmoid:", validation_mean_random_neg_sigmoid)
-    print("validation_gap_pos_random_neg:", validation_gap_pos_random_neg)
+    print("average_loss:", average_loss)
+    print("mean_pos_sigmoid:", mean_pos_sigmoid)
+    print("mean_negative_sigmoid:", mean_negative_sigmoid)
+    print("gap_pos_negative:", gap_pos_negative)
     print("=" * 80)
 
     return {
-        "validation_average_loss": validation_average_loss,
-        "validation_mean_pos_sigmoid": validation_mean_pos_sigmoid,
-        "validation_mean_random_neg_sigmoid": validation_mean_random_neg_sigmoid,
-        "validation_gap_pos_random_neg": validation_gap_pos_random_neg,
+        "average_loss": average_loss,
+        "mean_pos_sigmoid": mean_pos_sigmoid,
+        "mean_negative_sigmoid": mean_negative_sigmoid,
+        "gap_pos_negative": gap_pos_negative,
         "evaluated_events": evaluated_events,
         "skipped_events": skipped_events,
     }
-
 
 def build_config():
     cfg = SeedConfig()
 
     cfg.device_acc = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Données non normalisées
-    # cfg.input_tensor_path = "/gpfs/workdir/thibauts/tensor_output_charge_MH11000"
-    # cfg.dataset_name = "seeding_data_charge_MH11000"
-    
-    # Données normalisées avec log1p appliqué à la charge
     cfg.input_tensor_path = "/gpfs/workdir/thibauts/tensor_output_charge_log_norm_MH11000"
     cfg.dataset_name = "seeding_data_charge_log_norm_MH11000"
 
@@ -822,7 +753,6 @@ def build_config():
     cfg.regression = False
 
     return cfg
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -964,8 +894,8 @@ def main():
         epoch_pos_sigmoid_sum = 0.0
         epoch_pos_count = 0
 
-        epoch_random_neg_sigmoid_sum = 0.0
-        epoch_random_neg_count = 0
+        epoch_negative_sigmoid_sum = 0.0
+        epoch_negative_count = 0
 
         stop_epoch_early = False
 
@@ -1056,32 +986,6 @@ def main():
                     local_candidate_pool=512,
                     debug_print=False,
                 )
-                
-                # loss, loss_debug = top_attention_loss(
-                #     attention_map,
-                #     pairs1,
-                #     pairs2,
-                #     target,
-                #     particle_ids,
-                #     batched_mask,
-                #     return_debug=True,
-                #     hard_negative_fraction=hard_negative_fraction,
-                # )
-
-
-                # loss, loss_debug = top_attention_loss(
-                #     attention_map,
-                #     pairs1,
-                #     pairs2,
-                #     target,
-                #     particle_ids,
-                #     batched_mask,
-                #     return_debug=True,
-                #     hard_negative_fraction=hard_negative_fraction,
-                #     negative_sampling="global",
-                #     debug_print=False,
-                # )
-
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(
@@ -1089,7 +993,7 @@ def main():
                     )
 
                 positive_scores = loss_debug["positive_scores"]
-                random_negative_scores = loss_debug["random_negative_scores"]
+                negative_scores = loss_debug["random_negative_scores"]
 
                 if debug_pair_checks and training_debug_checks_done < debug_pair_checks_events:
                     print_pair_truth_debug(
@@ -1113,10 +1017,10 @@ def main():
                         epoch_pos_sigmoid_sum += positive_sigmoid.sum().item()
                         epoch_pos_count += positive_sigmoid.numel()
 
-                    if random_negative_scores.numel() > 0:
-                        random_negative_sigmoid = torch.sigmoid(random_negative_scores)
-                        epoch_random_neg_sigmoid_sum += random_negative_sigmoid.sum().item()
-                        epoch_random_neg_count += random_negative_sigmoid.numel()
+                    if negative_scores.numel() > 0:
+                        negative_sigmoid = torch.sigmoid(negative_scores)
+                        epoch_negative_sigmoid_sum += negative_sigmoid.sum().item()
+                        epoch_negative_count += negative_sigmoid.numel()
 
                 loss.backward()
                 optimizer.step()
@@ -1149,10 +1053,10 @@ def main():
                             torch.sigmoid(positive_scores).mean().item(),
                         )
 
-                    if random_negative_scores.numel() > 0:
+                    if negative_scores.numel() > 0:
                         print(
-                            "batch mean sigmoid random negatives:",
-                            torch.sigmoid(random_negative_scores).mean().item(),
+                            "batch mean sigmoid negatives:",
+                            torch.sigmoid(negative_scores).mean().item(),
                         )
 
                     if cfg.device_acc.type == "cuda":
@@ -1169,12 +1073,12 @@ def main():
 
         avg_loss = epoch_loss_sum / successful_events if successful_events > 0 else float("nan")
         mean_pos_sigmoid = epoch_pos_sigmoid_sum / epoch_pos_count if epoch_pos_count > 0 else float("nan")
-        mean_random_neg_sigmoid = (
-            epoch_random_neg_sigmoid_sum / epoch_random_neg_count
-            if epoch_random_neg_count > 0
+        mean_negative_sigmoid = (
+            epoch_negative_sigmoid_sum / epoch_negative_count
+            if epoch_negative_count > 0
             else float("nan")
         )
-        gap_pos_random_neg = mean_pos_sigmoid - mean_random_neg_sigmoid
+        gap_pos_negative = mean_pos_sigmoid - mean_negative_sigmoid
 
         print()
         print("=" * 80)
@@ -1184,8 +1088,8 @@ def main():
         print("skipped_events:", skipped_events)
         print("average_loss:", avg_loss)
         print("mean_pos_sigmoid:", mean_pos_sigmoid)
-        print("mean_random_neg_sigmoid:", mean_random_neg_sigmoid)
-        print("gap_pos_random_neg:", gap_pos_random_neg)
+        print("mean_negative_sigmoid:", mean_negative_sigmoid)
+        print("gap_pos_negative:", gap_pos_negative)
 
         if cfg.device_acc.type == "cuda":
             print("peak memory GB:", torch.cuda.max_memory_allocated() / 1024**3)
@@ -1198,8 +1102,8 @@ def main():
                 "hard_negative_fraction": hard_negative_fraction,
                 "average_loss": avg_loss,
                 "mean_pos_sigmoid": mean_pos_sigmoid,
-                "mean_random_neg_sigmoid": mean_random_neg_sigmoid,
-                "gap_pos_random_neg": gap_pos_random_neg,
+                "mean_negative_sigmoid": mean_negative_sigmoid,
+                "gap_pos_negative": gap_pos_negative,
                 "successful_events": successful_events,
                 "skipped_events": skipped_events,
             }
@@ -1209,11 +1113,12 @@ def main():
             model=model,
             dataset=dataset,
             cfg=cfg,
-            validation_file_indices=train_file_indices,
+            file_indices=train_file_indices,
+            stage_name="Train-set evaluation",
             epoch=epoch,
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
-            max_eval_events=200,
+            max_eval_events=args.max_eval_events,
             random_seed=12345,
             debug_pair_checks=False,
             debug_pair_checks_events=0,
@@ -1223,29 +1128,21 @@ def main():
             {
                 "epoch": epoch + 1,
                 "hard_negative_fraction": hard_negative_fraction,
-                "train_eval_average_loss": train_eval_metrics["validation_average_loss"],
-                "train_eval_mean_pos_sigmoid": train_eval_metrics["validation_mean_pos_sigmoid"],
-                "train_eval_mean_random_neg_sigmoid": train_eval_metrics["validation_mean_random_neg_sigmoid"],
-                "train_eval_gap_pos_random_neg": train_eval_metrics["validation_gap_pos_random_neg"],
+                "train_eval_average_loss": train_eval_metrics["average_loss"],
+                "train_eval_mean_pos_sigmoid": train_eval_metrics["mean_pos_sigmoid"],
+                "train_eval_mean_negative_sigmoid": train_eval_metrics["mean_negative_sigmoid"],
+                "train_eval_gap_pos_negative": train_eval_metrics["gap_pos_negative"],
                 "evaluated_events": train_eval_metrics["evaluated_events"],
                 "skipped_events": train_eval_metrics["skipped_events"],
             }
         )
 
-        print()
-        print("=" * 80)
-        print("Train-set evaluation summary")
-        print("train_eval_average_loss:", train_eval_metrics["validation_average_loss"])
-        print("train_eval_mean_pos_sigmoid:", train_eval_metrics["validation_mean_pos_sigmoid"])
-        print("train_eval_mean_random_neg_sigmoid:", train_eval_metrics["validation_mean_random_neg_sigmoid"])
-        print("train_eval_gap_pos_random_neg:", train_eval_metrics["validation_gap_pos_random_neg"])
-        print("=" * 80)
-
         validation_metrics = evaluate_model_after_epoch(
             model=model,
             dataset=dataset,
             cfg=cfg,
-            validation_file_indices=validation_file_indices,
+            file_indices=validation_file_indices,
+            stage_name="Held-out validation",
             epoch=epoch,
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
@@ -1259,10 +1156,10 @@ def main():
             {
                 "epoch": epoch + 1,
                 "hard_negative_fraction": hard_negative_fraction,
-                "validation_average_loss": validation_metrics["validation_average_loss"],
-                "validation_mean_pos_sigmoid": validation_metrics["validation_mean_pos_sigmoid"],
-                "validation_mean_random_neg_sigmoid": validation_metrics["validation_mean_random_neg_sigmoid"],
-                "validation_gap_pos_random_neg": validation_metrics["validation_gap_pos_random_neg"],
+                "validation_average_loss": validation_metrics["average_loss"],
+                "validation_mean_pos_sigmoid": validation_metrics["mean_pos_sigmoid"],
+                "validation_mean_negative_sigmoid": validation_metrics["mean_negative_sigmoid"],
+                "validation_gap_pos_negative": validation_metrics["gap_pos_negative"],
                 "evaluated_events": validation_metrics["evaluated_events"],
                 "skipped_events": validation_metrics["skipped_events"],
             }
@@ -1292,16 +1189,16 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
                 "mean_pos_sigmoid": mean_pos_sigmoid,
-                "mean_random_neg_sigmoid": mean_random_neg_sigmoid,
-                "gap_pos_random_neg": gap_pos_random_neg,
-                "train_eval_average_loss": train_eval_metrics["validation_average_loss"],
-                "train_eval_mean_pos_sigmoid": train_eval_metrics["validation_mean_pos_sigmoid"],
-                "train_eval_mean_random_neg_sigmoid": train_eval_metrics["validation_mean_random_neg_sigmoid"],
-                "train_eval_gap_pos_random_neg": train_eval_metrics["validation_gap_pos_random_neg"],
-                "validation_average_loss": validation_metrics["validation_average_loss"],
-                "validation_mean_pos_sigmoid": validation_metrics["validation_mean_pos_sigmoid"],
-                "validation_mean_random_neg_sigmoid": validation_metrics["validation_mean_random_neg_sigmoid"],
-                "validation_gap_pos_random_neg": validation_metrics["validation_gap_pos_random_neg"],
+                "mean_negative_sigmoid": mean_negative_sigmoid,
+                "gap_pos_negative": gap_pos_negative,
+                "train_eval_average_loss": train_eval_metrics["average_loss"],
+                "train_eval_mean_pos_sigmoid": train_eval_metrics["mean_pos_sigmoid"],
+                "train_eval_mean_negative_sigmoid": train_eval_metrics["mean_negative_sigmoid"],
+                "train_eval_gap_pos_negative": train_eval_metrics["gap_pos_negative"],
+                "validation_average_loss": validation_metrics["average_loss"],
+                "validation_mean_pos_sigmoid": validation_metrics["mean_pos_sigmoid"],
+                "validation_mean_negative_sigmoid": validation_metrics["mean_negative_sigmoid"],
+                "validation_gap_pos_negative": validation_metrics["gap_pos_negative"],
                 "cfg": cfg,
                 "train_file_indices": train_file_indices,
                 "validation_file_indices": validation_file_indices,
@@ -1316,9 +1213,8 @@ def main():
     print("Final training metrics CSV:", os.path.join(checkpoint_dir, "training_gap_metrics.csv"))
     print("Final train-set evaluation metrics CSV:", os.path.join(checkpoint_dir, "train_eval_gap_metrics.csv"))
     print("Final validation metrics CSV:", os.path.join(checkpoint_dir, "validation_gap_metrics.csv"))
-    print("Final training gap plot:", os.path.join(attention_plot_dir, "gap_pos_vs_random_neg.png"))
-    print("Final validation gap plot:", os.path.join(attention_plot_dir, "validation_gap_pos_vs_random_neg.png"))
-
+    print("Final training gap plot:", os.path.join(attention_plot_dir, "gap_pos_vs_negative.png"))
+    print("Final validation gap plot:", os.path.join(attention_plot_dir, "validation_gap_pos_vs_negative.png"))
 
 if __name__ == "__main__":
     main()
