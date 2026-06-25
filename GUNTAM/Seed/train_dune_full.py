@@ -14,8 +14,10 @@ from GUNTAM.Seed.Config import SeedConfig
 from GUNTAM.Seed.SeedLoss import top_attention_loss
 from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
-def get_hard_negative_fraction(epoch):
-    return 0.0
+def get_hard_negative_fraction(epoch, hard_negative_start_epoch=3, hard_negative_fraction=0.05):
+    if epoch + 1 < hard_negative_start_epoch:
+        return 0.0
+    return hard_negative_fraction
 
 
 def split_file_indices(num_files, validation_fraction):
@@ -75,6 +77,28 @@ def tensor_stats(name, tensor):
         tensor.max().item(),
         "mean=",
         tensor.mean().item(),
+    )
+
+
+def get_loss_negative_scores(loss_debug):
+    if "negative_scores" in loss_debug:
+        return loss_debug["negative_scores"]
+
+    random_negative_scores = loss_debug.get("random_negative_scores", None)
+    hard_negative_scores = loss_debug.get("hard_negative_scores", None)
+
+    if random_negative_scores is not None and hard_negative_scores is not None:
+        return torch.cat([random_negative_scores, hard_negative_scores], dim=0)
+
+    if random_negative_scores is not None:
+        return random_negative_scores
+
+    if hard_negative_scores is not None:
+        return hard_negative_scores
+
+    raise KeyError(
+        "loss_debug must contain 'negative_scores' or at least one of "
+        "'random_negative_scores' and 'hard_negative_scores'."
     )
 
 def get_debug_pair_tensors(loss_debug, possible_left_names, possible_right_names):
@@ -551,6 +575,8 @@ def evaluate_model_after_epoch(
     hard_negative_fraction,
     max_positive_pairs,
     max_eval_events,
+    local_negative_k,
+    local_candidate_pool,
     random_seed,
     debug_pair_checks,
     debug_pair_checks_events,
@@ -646,8 +672,8 @@ def evaluate_model_after_epoch(
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
                     negative_sampling="local",
-                    local_negative_k=50,
-                    local_candidate_pool=512,
+                    local_negative_k=local_negative_k,
+                    local_candidate_pool=local_candidate_pool,
                     debug_print=False,
                 )
 
@@ -676,7 +702,7 @@ def evaluate_model_after_epoch(
                 evaluated_events += 1
 
                 positive_scores = loss_debug["positive_scores"]
-                negative_scores = loss_debug["random_negative_scores"]
+                negative_scores = get_loss_negative_scores(loss_debug)
 
                 if positive_scores.numel() > 0:
                     positive_sigmoid = torch.sigmoid(positive_scores)
@@ -768,6 +794,10 @@ def main():
     parser.add_argument("--validation_fraction", type=float, default=0.2)
     parser.add_argument("--debug_pair_checks", type=int, default=1)
     parser.add_argument("--debug_pair_checks_events", type=int, default=1)
+    parser.add_argument("--hard_negative_fraction", type=float, default=0.05)
+    parser.add_argument("--hard_negative_start_epoch", type=int, default=3)
+    parser.add_argument("--local_negative_k", type=int, default=50)
+    parser.add_argument("--local_candidate_pool", type=int, default=512)
 
     args = parser.parse_args()
 
@@ -782,6 +812,10 @@ def main():
     print_every = args.print_every
     debug_pair_checks = bool(args.debug_pair_checks)
     debug_pair_checks_events = args.debug_pair_checks_events
+    hard_negative_fraction_target = args.hard_negative_fraction
+    hard_negative_start_epoch = args.hard_negative_start_epoch
+    local_negative_k = args.local_negative_k
+    local_candidate_pool = args.local_candidate_pool
 
     if args.run_name is None:
         run_name = f"MH11000_charge_E{num_epochs}_P{max_positive_pairs}_lr1e-3_true_validation"
@@ -865,6 +899,10 @@ def main():
     print("shift:", cfg.shift)
     print("debug_pair_checks:", debug_pair_checks)
     print("debug_pair_checks_events:", debug_pair_checks_events)
+    print("hard_negative_fraction_target:", hard_negative_fraction_target)
+    print("hard_negative_start_epoch:", hard_negative_start_epoch)
+    print("local_negative_k:", local_negative_k)
+    print("local_candidate_pool:", local_candidate_pool)
 
     global_step = 0
     epoch_history = []
@@ -877,7 +915,11 @@ def main():
         torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(num_epochs):
-        hard_negative_fraction = get_hard_negative_fraction(epoch)
+        hard_negative_fraction = get_hard_negative_fraction(
+            epoch,
+            hard_negative_start_epoch=hard_negative_start_epoch,
+            hard_negative_fraction=hard_negative_fraction_target,
+        )
 
         print()
         print("=" * 80)
@@ -982,8 +1024,8 @@ def main():
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
                     negative_sampling="local",
-                    local_negative_k=50,
-                    local_candidate_pool=512,
+                    local_negative_k=local_negative_k,
+                    local_candidate_pool=local_candidate_pool,
                     debug_print=False,
                 )
 
@@ -993,7 +1035,7 @@ def main():
                     )
 
                 positive_scores = loss_debug["positive_scores"]
-                negative_scores = loss_debug["random_negative_scores"]
+                negative_scores = get_loss_negative_scores(loss_debug)
 
                 if debug_pair_checks and training_debug_checks_done < debug_pair_checks_events:
                     print_pair_truth_debug(
@@ -1047,6 +1089,9 @@ def main():
                     print("num negative candidates:", loss_debug["num_negative_candidates"].item())
                     print("num selected negatives:", loss_debug["num_selected_negatives"].item())
 
+                    print("num selected random negatives:", loss_debug["random_negative_scores"].numel())
+                    print("num selected hard negatives:", loss_debug["hard_negative_scores"].numel())
+
                     if positive_scores.numel() > 0:
                         print(
                             "batch mean sigmoid positives:",
@@ -1057,6 +1102,12 @@ def main():
                         print(
                             "batch mean sigmoid negatives:",
                             torch.sigmoid(negative_scores).mean().item(),
+                        )
+
+                    if "hard_negative_scores" in loss_debug and loss_debug["hard_negative_scores"].numel() > 0:
+                        print(
+                            "batch mean sigmoid local hard negatives:",
+                            torch.sigmoid(loss_debug["hard_negative_scores"]).mean().item(),
                         )
 
                     if cfg.device_acc.type == "cuda":
@@ -1119,6 +1170,8 @@ def main():
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
             max_eval_events=args.max_eval_events,
+            local_negative_k=local_negative_k,
+            local_candidate_pool=local_candidate_pool,
             random_seed=12345,
             debug_pair_checks=False,
             debug_pair_checks_events=0,
@@ -1147,6 +1200,8 @@ def main():
             hard_negative_fraction=hard_negative_fraction,
             max_positive_pairs=max_positive_pairs,
             max_eval_events=args.max_eval_events,
+            local_negative_k=local_negative_k,
+            local_candidate_pool=local_candidate_pool,
             random_seed=12345,
             debug_pair_checks=debug_pair_checks,
             debug_pair_checks_events=debug_pair_checks_events,
@@ -1185,6 +1240,10 @@ def main():
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "hard_negative_fraction": hard_negative_fraction,
+                "hard_negative_fraction_target": hard_negative_fraction_target,
+                "hard_negative_start_epoch": hard_negative_start_epoch,
+                "local_negative_k": local_negative_k,
+                "local_candidate_pool": local_candidate_pool,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
