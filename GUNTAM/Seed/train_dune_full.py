@@ -14,10 +14,26 @@ from GUNTAM.Seed.Config import SeedConfig
 from GUNTAM.Seed.SeedLoss import top_attention_loss
 from GUNTAM.IO.PrepareTensor import sample_positive_pairs_from_particle_ids
 
-def get_hard_negative_fraction(epoch, hard_negative_start_epoch=3, hard_negative_fraction=0.05):
-    if epoch + 1 < hard_negative_start_epoch:
+def get_hard_negative_fraction(
+    epoch,
+    hard_negative_start_epoch=3,
+    hard_negative_final_epoch=20,
+    hard_negative_fraction=0.3,
+):
+    """Linear hard-negative curriculum. epoch is zero-indexed."""
+    epoch_number = epoch + 1
+
+    if epoch_number < hard_negative_start_epoch:
         return 0.0
-    return hard_negative_fraction
+
+    if hard_negative_final_epoch <= hard_negative_start_epoch:
+        return hard_negative_fraction
+
+    progress = (epoch_number - hard_negative_start_epoch + 1) / (
+        hard_negative_final_epoch - hard_negative_start_epoch + 1
+    )
+    progress = max(0.0, min(1.0, progress))
+    return hard_negative_fraction * progress
 
 
 def split_file_indices(num_files, validation_fraction):
@@ -368,6 +384,36 @@ def save_train_eval_metrics_csv(train_eval_history, checkpoint_dir):
 
     print("Saved train-set evaluation metrics CSV:", metrics_csv_path)
 
+
+def load_metrics_csv_if_exists(metrics_csv_path):
+    if not os.path.exists(metrics_csv_path):
+        return []
+
+    int_fields = {"epoch", "successful_events", "evaluated_events", "skipped_events"}
+    rows = []
+
+    with open(metrics_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            converted = {}
+            for key, value in row.items():
+                if value is None or value == "":
+                    converted[key] = value
+                    continue
+
+                try:
+                    if key in int_fields:
+                        converted[key] = int(float(value))
+                    else:
+                        converted[key] = float(value)
+                except ValueError:
+                    converted[key] = value
+
+            rows.append(converted)
+
+    print("Loaded previous metrics CSV:", metrics_csv_path, "rows:", len(rows))
+    return rows
+
 def save_gap_plot(epoch_history, attention_plot_dir):
     if len(epoch_history) == 0:
         return
@@ -577,6 +623,7 @@ def evaluate_model_after_epoch(
     max_eval_events,
     local_negative_k,
     local_candidate_pool,
+    negative_sampling,
     random_seed,
     debug_pair_checks,
     debug_pair_checks_events,
@@ -671,7 +718,7 @@ def evaluate_model_after_epoch(
                     hits=batched_hits,
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
-                    negative_sampling="local",
+                    negative_sampling=negative_sampling,
                     local_negative_k=local_negative_k,
                     local_candidate_pool=local_candidate_pool,
                     debug_print=False,
@@ -794,10 +841,13 @@ def main():
     parser.add_argument("--validation_fraction", type=float, default=0.2)
     parser.add_argument("--debug_pair_checks", type=int, default=1)
     parser.add_argument("--debug_pair_checks_events", type=int, default=1)
-    parser.add_argument("--hard_negative_fraction", type=float, default=0.05)
+    parser.add_argument("--negative_sampling", type=str, default="global", choices=["global", "local"])
+    parser.add_argument("--hard_negative_fraction", type=float, default=0.3)
     parser.add_argument("--hard_negative_start_epoch", type=int, default=3)
+    parser.add_argument("--hard_negative_final_epoch", type=int, default=20)
     parser.add_argument("--local_negative_k", type=int, default=50)
     parser.add_argument("--local_candidate_pool", type=int, default=512)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -812,8 +862,10 @@ def main():
     print_every = args.print_every
     debug_pair_checks = bool(args.debug_pair_checks)
     debug_pair_checks_events = args.debug_pair_checks_events
+    negative_sampling = args.negative_sampling
     hard_negative_fraction_target = args.hard_negative_fraction
     hard_negative_start_epoch = args.hard_negative_start_epoch
+    hard_negative_final_epoch = args.hard_negative_final_epoch
     local_negative_k = args.local_negative_k
     local_candidate_pool = args.local_candidate_pool
 
@@ -899,25 +951,62 @@ def main():
     print("shift:", cfg.shift)
     print("debug_pair_checks:", debug_pair_checks)
     print("debug_pair_checks_events:", debug_pair_checks_events)
+    print("negative_sampling:", negative_sampling)
     print("hard_negative_fraction_target:", hard_negative_fraction_target)
     print("hard_negative_start_epoch:", hard_negative_start_epoch)
+    print("hard_negative_final_epoch:", hard_negative_final_epoch)
     print("local_negative_k:", local_negative_k)
     print("local_candidate_pool:", local_candidate_pool)
+    print("resume_checkpoint:", args.resume_checkpoint)
 
+    start_epoch = 0
     global_step = 0
+
+    if args.resume_checkpoint is not None:
+        print("Loading checkpoint:", args.resume_checkpoint)
+        checkpoint = torch.load(
+            args.resume_checkpoint,
+            map_location=cfg.device_acc,
+            weights_only=False,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        if checkpoint.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+                                                                            
+                                                                       
+        start_epoch = int(checkpoint.get("epoch", 0))
+        global_step = int(checkpoint.get("global_step", 0))
+        print("Resuming from next epoch:", start_epoch + 1)
+        print("Resuming global_step:", global_step)
+
     epoch_history = []
     train_eval_history = []
     validation_history = []
+
+    if args.resume_checkpoint is not None:
+        epoch_history = load_metrics_csv_if_exists(
+            os.path.join(checkpoint_dir, "training_gap_metrics.csv")
+        )
+        train_eval_history = load_metrics_csv_if_exists(
+            os.path.join(checkpoint_dir, "train_eval_gap_metrics.csv")
+        )
+        validation_history = load_metrics_csv_if_exists(
+            os.path.join(checkpoint_dir, "validation_gap_metrics.csv")
+        )
+
     training_debug_checks_done = 0
 
     if cfg.device_acc.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         hard_negative_fraction = get_hard_negative_fraction(
             epoch,
             hard_negative_start_epoch=hard_negative_start_epoch,
+            hard_negative_final_epoch=hard_negative_final_epoch,
             hard_negative_fraction=hard_negative_fraction_target,
         )
 
@@ -1023,7 +1112,7 @@ def main():
                     hits=batched_hits,
                     return_debug=True,
                     hard_negative_fraction=hard_negative_fraction,
-                    negative_sampling="local",
+                    negative_sampling=negative_sampling,
                     local_negative_k=local_negative_k,
                     local_candidate_pool=local_candidate_pool,
                     debug_print=False,
@@ -1172,6 +1261,7 @@ def main():
             max_eval_events=args.max_eval_events,
             local_negative_k=local_negative_k,
             local_candidate_pool=local_candidate_pool,
+            negative_sampling=negative_sampling,
             random_seed=12345,
             debug_pair_checks=False,
             debug_pair_checks_events=0,
@@ -1202,6 +1292,7 @@ def main():
             max_eval_events=args.max_eval_events,
             local_negative_k=local_negative_k,
             local_candidate_pool=local_candidate_pool,
+            negative_sampling=negative_sampling,
             random_seed=12345,
             debug_pair_checks=debug_pair_checks,
             debug_pair_checks_events=debug_pair_checks_events,
@@ -1242,6 +1333,8 @@ def main():
                 "hard_negative_fraction": hard_negative_fraction,
                 "hard_negative_fraction_target": hard_negative_fraction_target,
                 "hard_negative_start_epoch": hard_negative_start_epoch,
+                "hard_negative_final_epoch": hard_negative_final_epoch,
+                "negative_sampling": negative_sampling,
                 "local_negative_k": local_negative_k,
                 "local_candidate_pool": local_candidate_pool,
                 "model_state_dict": model.state_dict(),
