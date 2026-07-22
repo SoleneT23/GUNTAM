@@ -138,8 +138,6 @@ def compute_cluster_metrics(labels, true_particle_ids):
 
     noise_fraction = float((labels == -1).mean())
 
-    # Cluster purity:
-    # For each reconstructed cluster, count the dominant true particle.
     purity_num = 0
     purity_den = 0
 
@@ -156,8 +154,6 @@ def compute_cluster_metrics(labels, true_particle_ids):
 
     cluster_purity = purity_num / purity_den if purity_den > 0 else float("nan")
 
-    # Particle completeness:
-    # For each true particle, count how much of it is recovered in its dominant reconstructed cluster.
     completeness_num = 0
     completeness_den = 0
 
@@ -179,8 +175,6 @@ def compute_cluster_metrics(labels, true_particle_ids):
         completeness_num / completeness_den if completeness_den > 0 else float("nan")
     )
 
-    # Global clustering metrics.
-    # ARI and NMI compare predicted cluster labels to true particle IDs.
     try:
         ari = float(adjusted_rand_score(true_particle_ids, labels))
     except Exception:
@@ -231,18 +225,12 @@ def cluster_event_with_dbscan(
 
     real_indices_device = real_indices.to(attention_map.device)
 
-    # Keep only real hits.
     logits = attention_map[real_indices_device][:, real_indices_device]
 
-    # Model output is treated as a logit.
-    # Convert to similarity score in [0, 1].
     scores = torch.sigmoid(logits)
 
-    # Make the pair score symmetric.
     scores = 0.5 * (scores + scores.T)
 
-    # DBSCAN expects a distance matrix.
-    # High score means close, so distance = 1 - score.
     distances = 1.0 - scores
     distances.fill_diagonal_(0.0)
 
